@@ -49,7 +49,7 @@ TARGET_USES_UEFI      := true
 
 TARGET_BOARD_PLATFORM := sun
 TARGET_BOARD_PLATFORM_GPU := qcom-adreno840
-QCOM_BOARD_PLATFORMS  += xiaomi_sm8850
+QCOM_BOARD_PLATFORMS  += sun
 
 # ─────────────────────────────────────────────────────────
 # Kernel — prebuilt GKI 6.12, boot header v4, vendor_boot style
@@ -316,3 +316,5 @@ TW_DEVICE_VERSION     := POCO_F8_Ultra
 # Confirmed: ro.product.first_api_level=35, ro.board.first_api_level=35 (getprop)
 # fox_14.1 builds against SDK 34 AOSP base — BOARD_SYSTEMSDK_VERSIONS=34
 BOARD_SYSTEMSDK_VERSIONS := 34
+# FINGERPRINT
+BUILD_FINGERPRINT := "Redmi/myron/myron:16/BQ2A.250705.001-BP2A.250605.031.A3/OS3.0.303.0.WPMCNXM:user/release-keys"
