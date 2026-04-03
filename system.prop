@@ -12,7 +12,7 @@
 #
 
 ro.adb.secure=0
-ro.board.platform=xiaomi_sm8850
+ro.board.platform=sun
 ro.product.board=sun
 ro.boot.dynamic_partitions=true
 ro.virtual_ab.enabled=true
@@ -37,3 +37,6 @@ persist.sys.fuse.passthrough.enable=true
 
 # Boot device UFS path — confirmed from ro.boot.bootdevice (getprop)
 ro.boot.bootdevice=1d84000.ufshc
+# Keymint
+ro.hardware.keystore_desede=true
+ro.build.fingerprint=Redmi/myron/myron:16/BQ2A.250705.001-BP2A.250605.031.A3/OS3.0.303.0.WPMCNXM:user/release-keys
