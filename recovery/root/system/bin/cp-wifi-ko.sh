@@ -40,20 +40,11 @@ is_mounted() {
 mount_directory() {
     local dir=$1
     if ! is_mounted "$dir"; then
-        sleep 10
         log_print "Mounting $dir"
-        mount "$dir"
-        if [ $? -eq 0 ]; then
-            log_print "Successfully mounted $dir"
-            return 0
-        else
-            log_print "Failed to mount $dir"
-            return 1
-        fi
-    else
-        log_print "$dir is already mounted"
-        return 0
+        mount "$dir" 2>/dev/null || { log_print "Failed to mount $dir"; return 1; }
+        log_print "Successfully mounted $dir"
     fi
+    return 0
 }
 
 if [ ! -d "$TARGET_DIR" ]; then
