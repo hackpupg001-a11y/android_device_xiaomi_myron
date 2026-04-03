@@ -259,6 +259,9 @@ TW_USE_TOOLBOX          := true
 TW_ENABLE_ALL_PARTITION_TOOLS := true
 TW_USE_DMCTL            := true
 TW_USE_QCOM_HAPTICS_VIBRATOR := true
+TW_USE_BATTERY_SYSFS_STATS    := true
+TW_POWER_SUPPLY_BATTERY_PATH  := "/sys/class/power_supply/battery"
+TW_DEFAULT_TIMEZONE           := "Asia/Ho_Chi_Minh"
 
 # ─────────────────────────────────────────────────────────
 # Debug
