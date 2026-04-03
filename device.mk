@@ -66,7 +66,7 @@ PRODUCT_COPY_FILES += \
 # Confirmed keymint version=3 from odm vintf xml (adb shell)
 PRODUCT_COPY_FILES += \
     $(DEVICE_PATH)/recovery/root/vendor/etc/vintf/manifest.xml:$(TARGET_COPY_OUT_RECOVERY)/root/vendor/etc/vintf/manifest.xml \
-    $(DEVICE_PATH)/recovery/root/vendor/etc/vintf/manifest_xiaomi_sm8850.xml:$(TARGET_COPY_OUT_RECOVERY)/root/vendor/etc/vintf/manifest_xiaomi_sm8850.xml \
+    $(DEVICE_PATH)/recovery/root/vendor/etc/vintf/manifest_xiaomi_sm8850.xml:$(TARGET_COPY_OUT_RECOVERY)/root/vendor/etc/vintf/manifest_sun.xml \
     $(DEVICE_PATH)/recovery/root/vendor/etc/vintf/manifest/android.hardware.security.keymint-service-qti.xml:$(TARGET_COPY_OUT_RECOVERY)/root/vendor/etc/vintf/manifest/android.hardware.security.keymint-service-qti.xml \
     $(DEVICE_PATH)/recovery/root/vendor/etc/vintf/manifest/android.hardware.weaver-service.xml:$(TARGET_COPY_OUT_RECOVERY)/root/vendor/etc/vintf/manifest/android.hardware.weaver-service.xml \
     $(DEVICE_PATH)/recovery/root/vendor/etc/vintf/manifest/android.hardware.health-service.qti.xml:$(TARGET_COPY_OUT_RECOVERY)/root/vendor/etc/vintf/manifest/android.hardware.health-service.qti.xml \
