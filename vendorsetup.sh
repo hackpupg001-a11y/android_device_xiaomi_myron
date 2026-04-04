@@ -111,12 +111,11 @@ export OF_OPTIONS_LIST_NUM=6
 
 # ─── OrangeFox version ───────────────────────────────────────────────────────
 # Phải set để build ra R12.1 thay vì R11.3 (default của source 14.1)
-export FOX_VERSION="R12.1"
 
 # ─── Maintainer / variant ────────────────────────────────────────────────────
 export FOX_VARIANT="Xiaomi_myron_POCO_F8_Ultra"
 export FOX_MAINTAINER_PATCH_VERSION=$(date +%y%m%d)
-export OF_MAINTAINER="hackpupg001-a11y"
+export OF_MAINTAINER="Antuna"
 
 # ─── Magisk ───────────────────────────────────────────────────────────────────
 # Path phải khớp với file workflow download vào /tmp/misc/Magisk.zip
