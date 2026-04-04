@@ -188,7 +188,6 @@ jobs:
         export ALLOW_MISSING_DEPENDENCIES=true
         export BUILD_BROKEN_DUP_RULES=true
         export BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES=true
-        export FOX_VERSION="R12.1"
         export FOX_BUILD_DEVICE="${{ github.event.inputs.DEVICE_NAME }}"
         export CCACHE_DIR="$(pwd)/.ccache"
         export CCACHE_EXEC=$(command -v ccache)
@@ -240,7 +239,7 @@ jobs:
 
         # Rename output
         OUT_DIR="out/target/product/${DEVICE}"
-        IMG_NAME="OrangeFox-R12.1-${DEVICE}-${{ env.BUILD_DATE }}.img"
+        IMG_NAME="OrangeFox-14.1-${DEVICE}-${{ env.BUILD_DATE }}.img"
         mv "${OUT_DIR}/${{ github.event.inputs.BUILD_PARTITION }}.img" "${OUT_DIR}/${IMG_NAME}"
         echo "Build success!"
         ls -lh "${OUT_DIR}/${IMG_NAME}"
@@ -259,9 +258,9 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox-R12.1-${{ github.event.inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}.img
+          out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox-14.1-${{ github.event.inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}.img
           out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox*.zip
-        name: "OrangeFox-R12.1-${{ github.event.inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}-#${{ github.run_number }}"
+        name: "OrangeFox-14.1-${{ github.event.inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}-#${{ github.run_number }}"
         tag_name: "${{ env.BUILD_DATE }}-${{ github.run_id }}"
         body_path: device/${{ github.event.inputs.DEVICE_PATH }}/INFO.txt
         fail_on_unmatched_files: false
