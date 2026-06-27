@@ -51,7 +51,7 @@ jobs:
           elseif ($driveInput -match '[?&]id=([A-Za-z0-9_-]+)') { $fileId = $Matches[1] }
           else { throw "Không lấy được Google Drive file ID. Hãy nhập file ID hoặc link chia sẻ ZIP." }
 
-          python -c "import gdown,sys,os; p=gdown.download(id=sys.argv[1], output='source.zip', quiet=False, fuzzy=True); raise SystemExit(0 if p and os.path.exists('source.zip') and os.path.getsize('source.zip')>1024 else 1)" "$fileId"
+          python -c "import gdown,sys,os; p=gdown.download(id=sys.argv[1], output='source.zip', quiet=False); raise SystemExit(0 if p and os.path.exists('source.zip') and os.path.getsize('source.zip')>1024 else 1)" "$fileId"
           if (!(Test-Path source.zip)) { throw "Không tải được source.zip" }
 
           New-Item -ItemType Directory -Path source -Force | Out-Null
