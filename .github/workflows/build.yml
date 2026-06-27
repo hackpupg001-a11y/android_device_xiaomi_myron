@@ -1,10 +1,10 @@
-name: Build EAS Fault Insight EXE from Google Drive
+name: Build EAS Fault Web V29 from Google Drive
 
 on:
   workflow_dispatch:
     inputs:
       drive_url:
-        description: "Google Drive file ID hoặc link chia sẻ ZIP source EAS Fault"
+        description: "Google Drive file ID hoặc link chia sẻ ZIP source V29"
         required: true
         type: string
       python_version:
@@ -25,23 +25,20 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python without cache
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python_version }}
           architecture: x64
-          # KHÔNG bật cache:pip ở đây vì repo GitHub có thể không có requirements.txt.
-          # Source thật được tải từ Google Drive ở bước sau.
+          
 
       - name: Install build tools
         shell: pwsh
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install gdown nuitka ordered-set zstandard
-          python -m pip install Flask pandas numpy openpyxl xlrd pillow requests waitress
 
       - name: Download source ZIP from Google Drive
         shell: pwsh
@@ -49,17 +46,12 @@ jobs:
           DRIVE_URL: ${{ inputs.drive_url }}
         run: |
           $driveInput = $env:DRIVE_URL.Trim()
-          if ($driveInput -match '^[A-Za-z0-9_-]{20,}$') {
-            $fileId = $driveInput
-          } elseif ($driveInput -match '/d/([A-Za-z0-9_-]+)') {
-            $fileId = $Matches[1]
-          } elseif ($driveInput -match '[?&]id=([A-Za-z0-9_-]+)') {
-            $fileId = $Matches[1]
-          } else {
-            throw "Không lấy được Google Drive file ID từ drive_url."
-          }
+          if ($driveInput -match '^[A-Za-z0-9_-]{20,}$') { $fileId = $driveInput }
+          elseif ($driveInput -match '/d/([A-Za-z0-9_-]+)') { $fileId = $Matches[1] }
+          elseif ($driveInput -match '[?&]id=([A-Za-z0-9_-]+)') { $fileId = $Matches[1] }
+          else { throw "Không lấy được Google Drive file ID. Hãy nhập file ID hoặc link chia sẻ ZIP." }
 
-          python -c "import gdown,sys; p=gdown.download(id=sys.argv[1], output='source.zip', quiet=False); raise SystemExit(0 if p else 1)" "$fileId"
+          python -c "import gdown,sys,os; p=gdown.download(id=sys.argv[1], output='source.zip', quiet=False, fuzzy=True); raise SystemExit(0 if p and os.path.exists('source.zip') and os.path.getsize('source.zip')>1024 else 1)" "$fileId"
           if (!(Test-Path source.zip)) { throw "Không tải được source.zip" }
 
           New-Item -ItemType Directory -Path source -Force | Out-Null
@@ -69,49 +61,58 @@ jobs:
         shell: pwsh
         run: |
           $main = Get-ChildItem source -Filter app.py -File -Recurse |
-            Where-Object { $_.Directory.Name -ne '__pycache__' } |
+            Where-Object { $_.FullName -notmatch '__pycache__' } |
             Sort-Object { $_.FullName.Length } |
             Select-Object -First 1
-          if ($null -eq $main) { throw "Không tìm thấy app.py trong ZIP Drive" }
+          if ($null -eq $main) { throw "Không tìm thấy app.py chính trong ZIP" }
 
           $project = $main.Directory.FullName
+          if (!(Test-Path (Join-Path $project 'templates'))) { throw "Không tìm thấy thư mục templates cạnh app.py" }
+
           "PROJECT_DIR=$project" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Project: $project"
-          Get-ChildItem $project | Select-Object Name,Length,Mode | Format-Table -AutoSize
+          Get-ChildItem $project | Format-Table Name,Length
 
-      - name: Install project requirements if available
+      - name: Install project requirements
         shell: pwsh
         run: |
           Set-Location $env:PROJECT_DIR
           if (Test-Path requirements.txt) {
             python -m pip install -r requirements.txt
-          }
-          if (Test-Path requirements-build.txt) {
-            python -m pip install -r requirements-build.txt
+          } else {
+            python -m pip install "Flask>=2.2,<4" "pandas>=1.5" "openpyxl>=3.1" "xlrd>=2.0"
           }
 
       - name: Build EAS Fault Web EXE
         shell: pwsh
         run: |
           Set-Location $env:PROJECT_DIR
-          python -m nuitka app.py `
-            --standalone `
-            --mingw64 `
-            --assume-yes-for-downloads `
-            --output-dir=build_eas `
-            --output-filename=EAS_Fault_Insight.exe `
-            --include-package=flask `
-            --include-package=jinja2 `
-            --include-package=werkzeug `
-            --include-package=pandas `
-            --include-package=numpy `
-            --include-package=openpyxl `
-            --include-package=xlrd `
-            --include-package=PIL `
-            --nofollow-import-to=tkinter `
-            --nofollow-import-to=matplotlib `
-            --nofollow-import-to=numpy.tests `
-            --windows-console-mode=force
+
+          $nuitkaArgs = @(
+            'app.py',
+            '--standalone',
+            '--mingw64',
+            '--assume-yes-for-downloads',
+            '--output-dir=build_eas',
+            '--output-filename=EAS_Fault_Insight.exe',
+            '--include-package=flask',
+            '--include-package=pandas',
+            '--include-package=openpyxl',
+            '--include-package=xlrd',
+            '--nofollow-import-to=tkinter',
+            '--nofollow-import-to=matplotlib',
+            '--nofollow-import-to=scipy',
+            '--nofollow-import-to=IPython',
+            '--nofollow-import-to=pytest',
+            '--nofollow-import-to=numpy.tests',
+            '--windows-console-mode=force'
+          )
+
+          if (Test-Path templates) { $nuitkaArgs += '--include-data-dir=templates=templates' }
+          if (Test-Path data) { $nuitkaArgs += '--include-data-dir=data=data' }
+          if (Test-Path static) { $nuitkaArgs += '--include-data-dir=static=static' }
+
+          python -m nuitka @nuitkaArgs
 
       - name: Package standalone output
         shell: pwsh
@@ -119,36 +120,43 @@ jobs:
           Set-Location $env:PROJECT_DIR
 
           $exe = Get-ChildItem build_eas -Filter EAS_Fault_Insight.exe -File -Recurse | Select-Object -First 1
-          if ($null -eq $exe) { throw "Không tìm thấy EAS_Fault_Insight.exe" }
+          if ($null -eq $exe) { throw "Không tìm thấy EAS_Fault_Insight.exe sau khi build" }
           $dist = $exe.Directory.FullName
+          Write-Host "Dist: $dist"
 
-          foreach ($dir in @('templates', 'static', 'data', 'uploads', 'config')) {
-            if (Test-Path $dir) { Copy-Item $dir $dist -Recurse -Force }
+          foreach ($dir in @('templates', 'data', 'uploads', 'static')) {
+            if (Test-Path $dir) {
+              Copy-Item $dir $dist -Recurse -Force
+            } else {
+              New-Item -ItemType Directory -Path (Join-Path $dist $dir) -Force | Out-Null
+            }
           }
-          foreach ($file in @('.env', 'requirements.txt', 'START_FAST.cmd', 'START_EAS_WEB.cmd')) {
+          foreach ($file in @('README.txt', 'requirements.txt', 'START_FAST.cmd', 'START_EAS_WEB.cmd')) {
             if (Test-Path $file) { Copy-Item $file $dist -Force }
           }
 
-          $startFile = Join-Path $dist 'START_EAS_FAULT_EXE.cmd'
-          @'
-@echo off
-chcp 65001 >nul
-cd /d "%~dp0"
-title EAS Fault Insight EXE
-start "" powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 2; Start-Process 'http://127.0.0.1:5000'"
-"%~dp0EAS_Fault_Insight.exe"
-pause
-'@ | Set-Content -Path $startFile -Encoding UTF8
+          $startCmd = Join-Path $dist 'START_EAS_FAULT_EXE.cmd'
+          $startLines = @(
+            '@echo off',
+            'chcp 65001 >nul',
+            'cd /d "%~dp0"',
+            'title EAS Fault Insight',
+            'start "" powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 2; Start-Process ''http://127.0.0.1:5000''"',
+            '"EAS_Fault_Insight.exe"',
+            'pause'
+          )
+          Set-Content -Path $startCmd -Value $startLines -Encoding UTF8
 
-          $zip = Join-Path $env:GITHUB_WORKSPACE 'EAS_Fault_Insight_Standalone.zip'
-          Compress-Archive (Join-Path $dist '*') $zip -CompressionLevel Optimal
-          "OUT_ZIP=$zip" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'EAS_Fault_Insight_V29_Standalone.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $zip -CompressionLevel Optimal
+          "OUTPUT_ZIP=$zip" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EAS-Fault-Insight-Standalone
-          path: ${{ env.OUT_ZIP }}
+          name: EAS-Fault-Insight-V29-Standalone
+          path: ${{ env.OUTPUT_ZIP }}
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
