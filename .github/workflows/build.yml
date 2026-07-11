@@ -21,141 +21,318 @@ permissions:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
-    timeout-minutes: 120
+    # Cố định VS 2022, tránh windows-latest chuyển sang VS 2026 làm Nuitka thiếu ổn định.
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ inputs.python_version }}
           architecture: x64
-          
 
-      - name: Install build tools
-        shell: pwsh
+      - name: Install download and build tools
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install gdown nuitka ordered-set zstandard
+          python -m pip install "gdown>=5.2,<6" "Nuitka>=4.1,<4.2" ordered-set zstandard
+          python -m nuitka --version
 
       - name: Download source ZIP from Google Drive
-        shell: pwsh
         env:
           DRIVE_URL: ${{ inputs.drive_url }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $driveInput = $env:DRIVE_URL.Trim()
-          if ($driveInput -match '^[A-Za-z0-9_-]{20,}$') { $fileId = $driveInput }
-          elseif ($driveInput -match '/d/([A-Za-z0-9_-]+)') { $fileId = $Matches[1] }
-          elseif ($driveInput -match '[?&]id=([A-Za-z0-9_-]+)') { $fileId = $Matches[1] }
-          else { throw "Không lấy được Google Drive file ID. Hãy nhập file ID hoặc link chia sẻ ZIP." }
 
-          python -c "import gdown,sys,os; p=gdown.download(id=sys.argv[1], output='source.zip', quiet=False); raise SystemExit(0 if p and os.path.exists('source.zip') and os.path.getsize('source.zip')>1024 else 1)" "$fileId"
-          if (!(Test-Path source.zip)) { throw "Không tải được source.zip" }
-
-          New-Item -ItemType Directory -Path source -Force | Out-Null
-          Expand-Archive source.zip source -Force
-
-      - name: Locate Flask project
-        shell: pwsh
-        run: |
-          $main = Get-ChildItem source -Filter app.py -File -Recurse |
-            Where-Object { $_.FullName -notmatch '__pycache__' } |
-            Sort-Object { $_.FullName.Length } |
-            Select-Object -First 1
-          if ($null -eq $main) { throw "Không tìm thấy app.py chính trong ZIP" }
-
-          $project = $main.Directory.FullName
-          if (!(Test-Path (Join-Path $project 'templates'))) { throw "Không tìm thấy thư mục templates cạnh app.py" }
-
-          "PROJECT_DIR=$project" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Project: $project"
-          Get-ChildItem $project | Format-Table Name,Length
-
-      - name: Install project requirements
-        shell: pwsh
-        run: |
-          Set-Location $env:PROJECT_DIR
-          if (Test-Path requirements.txt) {
-            python -m pip install -r requirements.txt
+          if ($driveInput -match '^[A-Za-z0-9_-]{20,}$') {
+            $fileId = $driveInput
+          } elseif ($driveInput -match '/d/([A-Za-z0-9_-]+)') {
+            $fileId = $Matches[1]
+          } elseif ($driveInput -match '[?&]id=([A-Za-z0-9_-]+)') {
+            $fileId = $Matches[1]
           } else {
-            python -m pip install "Flask>=2.2,<4" "pandas>=1.5" "openpyxl>=3.1" "xlrd>=2.0"
+            throw 'Không lấy được Google Drive file ID. Hãy nhập file ID hoặc link chia sẻ ZIP.'
           }
 
-      - name: Build EAS Fault Web EXE
-        shell: pwsh
+          python -c "import gdown,sys,os; p=gdown.download(id=sys.argv[1], output='source.zip', quiet=False); raise SystemExit(0 if p and os.path.isfile(p) and os.path.getsize(p)>1024 else 1)" "$fileId"
+
+          if (!(Test-Path -LiteralPath source.zip)) {
+            throw 'Không tải được source.zip'
+          }
+
+          $zipSize = (Get-Item -LiteralPath source.zip).Length
+          Write-Host "Downloaded source.zip: $zipSize bytes"
+
+          New-Item -ItemType Directory -Path source -Force | Out-Null
+          Expand-Archive -LiteralPath source.zip -DestinationPath source -Force
+
+      - name: Locate Flask project
         run: |
-          Set-Location $env:PROJECT_DIR
+          $ErrorActionPreference = 'Stop'
+
+          $main = Get-ChildItem source -Filter app.py -File -Recurse |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](\.venv|venv|env|site-packages|__pycache__|build|dist)[\\/]' -and
+              (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'templates\index.html'))
+            } |
+            Sort-Object { $_.FullName.Length } |
+            Select-Object -First 1
+
+          if ($null -eq $main) {
+            throw 'Không tìm thấy app.py có templates/index.html cạnh nó trong ZIP.'
+          }
+
+          $project = $main.Directory.FullName
+          "PROJECT_DIR=$project" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Project: $project"
+          Get-ChildItem -LiteralPath $project | Format-Table Name, Length, LastWriteTime
+
+      - name: Install project requirements
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location -LiteralPath $env:PROJECT_DIR
+
+          if (Test-Path -LiteralPath requirements.txt) {
+            python -m pip install -r requirements.txt
+          } else {
+            python -m pip install `
+              "Flask>=3.1,<4" `
+              "pandas>=2.2,<3" `
+              "numpy>=1.26,<3" `
+              "python-calamine>=0.3,<1" `
+              "openpyxl>=3.1,<4" `
+              "xlrd>=2.0,<3"
+          }
+
+          # Bảo đảm các engine Excel import động của pandas đều thực sự tồn tại.
+          python -c "import flask,pandas,numpy,openpyxl,xlrd,python_calamine; print('Imports OK:', flask.__version__ if hasattr(flask,'__version__') else 'Flask', pandas.__version__, numpy.__version__)"
+          python -m pip check
+
+      - name: Build EAS Fault Web EXE
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location -LiteralPath $env:PROJECT_DIR
+
+          if (Test-Path -LiteralPath build_eas) {
+            Remove-Item build_eas -Recurse -Force
+          }
 
           $nuitkaArgs = @(
             'app.py',
-            '--standalone',
-            '--mingw64',
+            '--mode=standalone',
+            '--msvc=latest',
             '--assume-yes-for-downloads',
+            '--remove-output',
             '--output-dir=build_eas',
             '--output-filename=EAS_Fault_Insight.exe',
+            '--jobs=2',
+            '--lto=no',
             '--include-package=flask',
             '--include-package=pandas',
+            '--include-package=python_calamine',
             '--include-package=openpyxl',
             '--include-package=xlrd',
+            '--include-distribution-metadata=python-calamine',
             '--nofollow-import-to=tkinter',
             '--nofollow-import-to=matplotlib',
             '--nofollow-import-to=scipy',
             '--nofollow-import-to=IPython',
             '--nofollow-import-to=pytest',
             '--nofollow-import-to=numpy.tests',
-            '--windows-console-mode=force'
+            '--windows-console-mode=force',
+            '--report=build_eas\nuitka-build-report.xml'
           )
 
-          if (Test-Path templates) { $nuitkaArgs += '--include-data-dir=templates=templates' }
-          if (Test-Path data) { $nuitkaArgs += '--include-data-dir=data=data' }
-          if (Test-Path static) { $nuitkaArgs += '--include-data-dir=static=static' }
+          if (Test-Path -LiteralPath templates) {
+            $nuitkaArgs += '--include-data-dir=templates=templates'
+          }
+          if (Test-Path -LiteralPath static) {
+            $nuitkaArgs += '--include-data-dir=static=static'
+          }
 
+          Write-Host ('python -m nuitka ' + ($nuitkaArgs -join ' '))
           python -m nuitka @nuitkaArgs
 
-      - name: Package standalone output
-        shell: pwsh
+      - name: Prepare standalone folder
         run: |
-          Set-Location $env:PROJECT_DIR
+          $ErrorActionPreference = 'Stop'
+          Set-Location -LiteralPath $env:PROJECT_DIR
 
-          $exe = Get-ChildItem build_eas -Filter EAS_Fault_Insight.exe -File -Recurse | Select-Object -First 1
-          if ($null -eq $exe) { throw "Không tìm thấy EAS_Fault_Insight.exe sau khi build" }
+          $exe = Get-ChildItem build_eas -Filter EAS_Fault_Insight.exe -File -Recurse |
+            Select-Object -First 1
+          if ($null -eq $exe) {
+            throw 'Không tìm thấy EAS_Fault_Insight.exe sau khi build.'
+          }
+
           $dist = $exe.Directory.FullName
+          "DIST_DIR=$dist" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Dist: $dist"
 
-          foreach ($dir in @('templates', 'data', 'uploads', 'static')) {
-            if (Test-Path $dir) {
-              Copy-Item $dir $dist -Recurse -Force
-            } else {
-              New-Item -ItemType Directory -Path (Join-Path $dist $dir) -Force | Out-Null
+          # Template/static được copy thêm để Flask luôn tìm thấy cạnh EXE.
+          foreach ($dir in @('templates', 'static')) {
+            $sourceDir = Join-Path $env:PROJECT_DIR $dir
+            $targetDir = Join-Path $dist $dir
+            if (Test-Path -LiteralPath $sourceDir) {
+              if (Test-Path -LiteralPath $targetDir) {
+                Remove-Item -LiteralPath $targetDir -Recurse -Force
+              }
+              Copy-Item -LiteralPath $sourceDir -Destination $targetDir -Recurse -Force
+            } elseif (!(Test-Path -LiteralPath $targetDir)) {
+              New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
             }
           }
-          foreach ($file in @('README.txt', 'requirements.txt', 'START_FAST.cmd', 'START_EAS_WEB.cmd')) {
-            if (Test-Path $file) { Copy-Item $file $dist -Force }
+
+          # Giữ rule/reference trong data nhưng không đóng gói cache cũ.
+          $sourceData = Join-Path $env:PROJECT_DIR 'data'
+          $targetData = Join-Path $dist 'data'
+          if (Test-Path -LiteralPath $targetData) {
+            Remove-Item -LiteralPath $targetData -Recurse -Force
+          }
+          if (Test-Path -LiteralPath $sourceData) {
+            Copy-Item -LiteralPath $sourceData -Destination $targetData -Recurse -Force
+          } else {
+            New-Item -ItemType Directory -Path $targetData -Force | Out-Null
           }
 
-          $startCmd = Join-Path $dist 'START_EAS_FAULT_EXE.cmd'
-          $startLines = @(
-            '@echo off',
-            'chcp 65001 >nul',
-            'cd /d "%~dp0"',
-            'title EAS Fault Insight',
-            'start "" powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 2; Start-Process ''http://127.0.0.1:5000''"',
-            '"EAS_Fault_Insight.exe"',
-            'pause'
-          )
-          Set-Content -Path $startCmd -Value $startLines -Encoding UTF8
+          $cacheDir = Join-Path $targetData '.eas_cache'
+          if (Test-Path -LiteralPath $cacheDir) {
+            Remove-Item -LiteralPath $cacheDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
 
+          # Không đóng gói dữ liệu người dùng từng upload.
+          $targetUploads = Join-Path $dist 'uploads'
+          if (Test-Path -LiteralPath $targetUploads) {
+            Remove-Item -LiteralPath $targetUploads -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $targetUploads -Force | Out-Null
+
+          foreach ($file in @('README.txt', 'requirements.txt')) {
+            $sourceFile = Join-Path $env:PROJECT_DIR $file
+            if (Test-Path -LiteralPath $sourceFile) {
+              Copy-Item -LiteralPath $sourceFile -Destination $dist -Force
+            }
+          }
+
+          $launcherPs1 = @'
+          $ErrorActionPreference = "SilentlyContinue"
+          $exe = Join-Path $PSScriptRoot "EAS_Fault_Insight.exe"
+          if (!(Test-Path -LiteralPath $exe)) {
+              Write-Host "Không tìm thấy EAS_Fault_Insight.exe"
+              exit 1
+          }
+
+          Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot | Out-Null
+          $url = "http://127.0.0.1:5000"
+          $health = "$url/api/version"
+
+          for ($i = 0; $i -lt 120; $i++) {
+              try {
+                  $response = Invoke-WebRequest -Uri $health -UseBasicParsing -TimeoutSec 1
+                  if ($response.StatusCode -eq 200) {
+                      Start-Process $url
+                      exit 0
+                  }
+              } catch {
+              }
+              Start-Sleep -Milliseconds 500
+          }
+
+          Write-Host "Server chưa mở được sau 60 giây. Hãy xem cửa sổ EAS Fault Insight để đọc lỗi."
+          exit 1
+          '@
+          Set-Content -LiteralPath (Join-Path $dist 'START_EAS_FAULT_EXE.ps1') -Value $launcherPs1 -Encoding utf8
+
+          $launcherCmd = @'
+          @echo off
+          chcp 65001 >nul
+          cd /d "%~dp0"
+          title EAS Fault Insight Launcher
+          powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0START_EAS_FAULT_EXE.ps1"
+          if errorlevel 1 pause
+          '@
+          Set-Content -LiteralPath (Join-Path $dist 'START_EAS_FAULT_EXE.cmd') -Value $launcherCmd -Encoding ascii
+
+      - name: Smoke test compiled EXE
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exePath = Join-Path $env:DIST_DIR 'EAS_Fault_Insight.exe'
+          $stdout = Join-Path $env:RUNNER_TEMP 'eas-stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'eas-stderr.log'
+
+          $process = Start-Process `
+            -FilePath $exePath `
+            -WorkingDirectory $env:DIST_DIR `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru
+
+          $ready = $false
+          try {
+            for ($i = 0; $i -lt 120; $i++) {
+              $process.Refresh()
+              if ($process.HasExited) { break }
+
+              try {
+                $response = Invoke-WebRequest `
+                  -Uri 'http://127.0.0.1:5000/api/version' `
+                  -UseBasicParsing `
+                  -TimeoutSec 1
+                if ($response.StatusCode -eq 200) {
+                  Write-Host "Smoke test OK: $($response.Content)"
+                  $ready = $true
+                  break
+                }
+              } catch {
+              }
+              Start-Sleep -Milliseconds 500
+            }
+
+            if (!$ready) {
+              Write-Host '----- STDOUT -----'
+              if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout }
+              Write-Host '----- STDERR -----'
+              if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr }
+              throw 'EXE build xong nhưng không khởi động được Flask hoặc thiếu module/data.'
+            }
+          } finally {
+            $process.Refresh()
+            if (!$process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
+      - name: Package standalone output
+        run: |
+          $ErrorActionPreference = 'Stop'
           $zip = Join-Path $env:GITHUB_WORKSPACE 'EAS_Fault_Insight_V29_Standalone.zip'
-          if (Test-Path $zip) { Remove-Item $zip -Force }
-          Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $zip -CompressionLevel Optimal
+          if (Test-Path -LiteralPath $zip) {
+            Remove-Item -LiteralPath $zip -Force
+          }
+
+          Compress-Archive `
+            -Path (Join-Path $env:DIST_DIR '*') `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
+
+          if (!(Test-Path -LiteralPath $zip) -or (Get-Item -LiteralPath $zip).Length -lt 1MB) {
+            throw 'ZIP đầu ra không hợp lệ hoặc quá nhỏ.'
+          }
+
           "OUTPUT_ZIP=$zip" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Output: $zip"
+          Write-Host "Size: $((Get-Item -LiteralPath $zip).Length) bytes"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: EAS-Fault-Insight-V29-Standalone
+          name: EAS-Fault-Insight-V29-Standalone-Python-${{ inputs.python_version }}
           path: ${{ env.OUTPUT_ZIP }}
           if-no-files-found: error
           retention-days: 14
