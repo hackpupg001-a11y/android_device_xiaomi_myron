@@ -1,340 +1,151 @@
-name: Build EAS Fault Web V29 from Google Drive
+name: Build offline wheels - Windows 10 x64 - Python 3.11.9
 
 on:
   workflow_dispatch:
-    inputs:
-      drive_url:
-        description: "Google Drive file ID hoặc link chia sẻ ZIP source V29"
-        required: true
-        type: string
-      python_version:
-        description: "Python dùng để build"
-        required: true
-        default: "3.11"
-        type: choice
-        options:
-          - "3.11"
-          - "3.12"
 
 permissions:
   contents: read
 
 jobs:
-  build-windows:
-    # Cố định VS 2022, tránh windows-latest chuyển sang VS 2026 làm Nuitka thiếu ổn định.
+  build-wheelhouse:
     runs-on: windows-2022
-    timeout-minutes: 180
-
-    defaults:
-      run:
-        shell: pwsh
 
     steps:
-      - name: Setup Python
+      - name: Setup Python 3.11.9 x64
         uses: actions/setup-python@v6
         with:
-          python-version: ${{ inputs.python_version }}
-          architecture: x64
+          python-version: "3.11.9"
+          architecture: "x64"
 
-      - name: Install download and build tools
+      - name: Upgrade pip tools
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install "gdown>=5.2,<6" "Nuitka>=4.1,<4.2" ordered-set zstandard
-          python -m nuitka --version
+          python --version
+          python -m pip --version
 
-      - name: Download source ZIP from Google Drive
-        env:
-          DRIVE_URL: ${{ inputs.drive_url }}
+      - name: Download all wheels and dependencies
+        shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $driveInput = $env:DRIVE_URL.Trim()
+          New-Item -ItemType Directory -Force "offline_bundle\wheelhouse" | Out-Null
 
-          if ($driveInput -match '^[A-Za-z0-9_-]{20,}$') {
-            $fileId = $driveInput
-          } elseif ($driveInput -match '/d/([A-Za-z0-9_-]+)') {
-            $fileId = $Matches[1]
-          } elseif ($driveInput -match '[?&]id=([A-Za-z0-9_-]+)') {
-            $fileId = $Matches[1]
-          } else {
-            throw 'Không lấy được Google Drive file ID. Hãy nhập file ID hoặc link chia sẻ ZIP.'
-          }
+          @"
+          Flask==3.1.3
+          mobi==0.4.1
+          beautifulsoup4==4.15.0
+          waitress==3.0.2
+          "@ | Set-Content "offline_bundle\requirements.txt" -Encoding ascii
 
-          python -c "import gdown,sys,os; p=gdown.download(id=sys.argv[1], output='source.zip', quiet=False); raise SystemExit(0 if p and os.path.isfile(p) and os.path.getsize(p)>1024 else 1)" "$fileId"
+          python -m pip download `
+            --dest "offline_bundle\wheelhouse" `
+            --only-binary=:all: `
+            pip setuptools wheel
 
-          if (!(Test-Path -LiteralPath source.zip)) {
-            throw 'Không tải được source.zip'
-          }
+          python -m pip download `
+            --dest "offline_bundle\wheelhouse" `
+            --only-binary=:all: `
+            --requirement "offline_bundle\requirements.txt"
 
-          $zipSize = (Get-Item -LiteralPath source.zip).Length
-          Write-Host "Downloaded source.zip: $zipSize bytes"
-
-          New-Item -ItemType Directory -Path source -Force | Out-Null
-          Expand-Archive -LiteralPath source.zip -DestinationPath source -Force
-
-      - name: Locate Flask project
+      - name: Create offline installer
+        shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          @'
+          @echo off
+          setlocal
+          cd /d "%~dp0"
 
-          $main = Get-ChildItem source -Filter app.py -File -Recurse |
-            Where-Object {
-              $_.FullName -notmatch '[\\/](\.venv|venv|env|site-packages|__pycache__|build|dist)[\\/]' -and
-              (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'templates\index.html'))
-            } |
-            Sort-Object { $_.FullName.Length } |
-            Select-Object -First 1
+          echo ============================================
+          echo   Offline installer - Python 3.11 x64
+          echo ============================================
 
-          if ($null -eq $main) {
-            throw 'Không tìm thấy app.py có templates/index.html cạnh nó trong ZIP.'
-          }
-
-          $project = $main.Directory.FullName
-          "PROJECT_DIR=$project" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-
-          Write-Host "Project: $project"
-          Get-ChildItem -LiteralPath $project | Format-Table Name, Length, LastWriteTime
-
-      - name: Install project requirements
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location -LiteralPath $env:PROJECT_DIR
-
-          if (Test-Path -LiteralPath requirements.txt) {
-            python -m pip install -r requirements.txt
-          } else {
-            python -m pip install `
-              "Flask>=3.1,<4" `
-              "pandas>=2.2,<3" `
-              "numpy>=1.26,<3" `
-              "python-calamine>=0.3,<1" `
-              "openpyxl>=3.1,<4" `
-              "xlrd>=2.0,<3"
-          }
-
-          # Bảo đảm các engine Excel import động của pandas đều thực sự tồn tại.
-          python -c "import flask,pandas,numpy,openpyxl,xlrd,python_calamine; print('Imports OK:', flask.__version__ if hasattr(flask,'__version__') else 'Flask', pandas.__version__, numpy.__version__)"
-          python -m pip check
-
-      - name: Build EAS Fault Web EXE
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location -LiteralPath $env:PROJECT_DIR
-
-          if (Test-Path -LiteralPath build_eas) {
-            Remove-Item build_eas -Recurse -Force
-          }
-
-          $nuitkaArgs = @(
-            'app.py',
-            '--mode=standalone',
-            '--msvc=latest',
-            '--assume-yes-for-downloads',
-            '--remove-output',
-            '--output-dir=build_eas',
-            '--output-filename=EAS_Fault_Insight.exe',
-            '--jobs=2',
-            '--lto=no',
-            '--include-package=flask',
-            '--include-package=pandas',
-            '--include-package=python_calamine',
-            '--include-package=openpyxl',
-            '--include-package=xlrd',
-            '--include-distribution-metadata=python-calamine',
-            '--nofollow-import-to=tkinter',
-            '--nofollow-import-to=matplotlib',
-            '--nofollow-import-to=scipy',
-            '--nofollow-import-to=IPython',
-            '--nofollow-import-to=pytest',
-            '--nofollow-import-to=numpy.tests',
-            '--windows-console-mode=force',
-            '--report=build_eas\nuitka-build-report.xml'
+          where py >nul 2>nul
+          if errorlevel 1 (
+              echo [ERROR] Khong tim thay Python Launcher.
+              echo Hay cai Python 3.11.9 x64.
+              pause
+              exit /b 1
           )
 
-          if (Test-Path -LiteralPath templates) {
-            $nuitkaArgs += '--include-data-dir=templates=templates'
-          }
-          if (Test-Path -LiteralPath static) {
-            $nuitkaArgs += '--include-data-dir=static=static'
-          }
+          py -3.11 -c "import sys; assert sys.version_info[:2] == (3,11); print(sys.version)"
+          if errorlevel 1 (
+              echo [ERROR] Can Python 3.11.x.
+              pause
+              exit /b 1
+          )
 
-          Write-Host ('python -m nuitka ' + ($nuitkaArgs -join ' '))
-          python -m nuitka @nuitkaArgs
+          if not exist ".venv\Scripts\python.exe" (
+              echo [1/4] Tao .venv...
+              py -3.11 -m venv .venv
+              if errorlevel 1 goto :error
+          ) else (
+              echo [1/4] Da co .venv.
+          )
 
-      - name: Prepare standalone folder
+          echo [2/4] Cai pip, setuptools, wheel...
+          ".venv\Scripts\python.exe" -m pip install ^
+            --no-index ^
+            --find-links="%CD%\wheelhouse" ^
+            pip setuptools wheel
+          if errorlevel 1 goto :error
+
+          echo [3/4] Cai thu vien...
+          ".venv\Scripts\python.exe" -m pip install ^
+            --no-index ^
+            --find-links="%CD%\wheelhouse" ^
+            --requirement "%CD%\requirements.txt"
+          if errorlevel 1 goto :error
+
+          echo [4/4] Kiem tra dependency...
+          ".venv\Scripts\python.exe" -m pip check
+          if errorlevel 1 goto :error
+
+          echo.
+          echo [OK] Cai offline thanh cong.
+          pause
+          exit /b 0
+
+          :error
+          echo.
+          echo [ERROR] Cai dat that bai.
+          pause
+          exit /b 1
+          '@ | Set-Content "offline_bundle\install_offline.bat" -Encoding ascii
+
+      - name: Verify offline installation
+        shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location -LiteralPath $env:PROJECT_DIR
+          python -m venv verify_venv
 
-          $exe = Get-ChildItem build_eas -Filter EAS_Fault_Insight.exe -File -Recurse |
-            Select-Object -First 1
-          if ($null -eq $exe) {
-            throw 'Không tìm thấy EAS_Fault_Insight.exe sau khi build.'
-          }
+          .\verify_venv\Scripts\python.exe -m pip install `
+            --no-index `
+            --find-links="$PWD\offline_bundle\wheelhouse" `
+            --requirement "$PWD\offline_bundle\requirements.txt"
 
-          $dist = $exe.Directory.FullName
-          "DIST_DIR=$dist" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Dist: $dist"
+          .\verify_venv\Scripts\python.exe -m pip check
+          .\verify_venv\Scripts\python.exe -c "import flask, mobi, bs4, waitress; print('IMPORT OK')"
 
-          # Template/static được copy thêm để Flask luôn tìm thấy cạnh EXE.
-          foreach ($dir in @('templates', 'static')) {
-            $sourceDir = Join-Path $env:PROJECT_DIR $dir
-            $targetDir = Join-Path $dist $dir
-            if (Test-Path -LiteralPath $sourceDir) {
-              if (Test-Path -LiteralPath $targetDir) {
-                Remove-Item -LiteralPath $targetDir -Recurse -Force
-              }
-              Copy-Item -LiteralPath $sourceDir -Destination $targetDir -Recurse -Force
-            } elseif (!(Test-Path -LiteralPath $targetDir)) {
-              New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-            }
-          }
-
-          # Giữ rule/reference trong data nhưng không đóng gói cache cũ.
-          $sourceData = Join-Path $env:PROJECT_DIR 'data'
-          $targetData = Join-Path $dist 'data'
-          if (Test-Path -LiteralPath $targetData) {
-            Remove-Item -LiteralPath $targetData -Recurse -Force
-          }
-          if (Test-Path -LiteralPath $sourceData) {
-            Copy-Item -LiteralPath $sourceData -Destination $targetData -Recurse -Force
-          } else {
-            New-Item -ItemType Directory -Path $targetData -Force | Out-Null
-          }
-
-          $cacheDir = Join-Path $targetData '.eas_cache'
-          if (Test-Path -LiteralPath $cacheDir) {
-            Remove-Item -LiteralPath $cacheDir -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
-
-          # Không đóng gói dữ liệu người dùng từng upload.
-          $targetUploads = Join-Path $dist 'uploads'
-          if (Test-Path -LiteralPath $targetUploads) {
-            Remove-Item -LiteralPath $targetUploads -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $targetUploads -Force | Out-Null
-
-          foreach ($file in @('README.txt', 'requirements.txt')) {
-            $sourceFile = Join-Path $env:PROJECT_DIR $file
-            if (Test-Path -LiteralPath $sourceFile) {
-              Copy-Item -LiteralPath $sourceFile -Destination $dist -Force
-            }
-          }
-
-          $launcherPs1 = @'
-          $ErrorActionPreference = "SilentlyContinue"
-          $exe = Join-Path $PSScriptRoot "EAS_Fault_Insight.exe"
-          if (!(Test-Path -LiteralPath $exe)) {
-              Write-Host "Không tìm thấy EAS_Fault_Insight.exe"
-              exit 1
-          }
-
-          Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot | Out-Null
-          $url = "http://127.0.0.1:5000"
-          $health = "$url/api/version"
-
-          for ($i = 0; $i -lt 120; $i++) {
-              try {
-                  $response = Invoke-WebRequest -Uri $health -UseBasicParsing -TimeoutSec 1
-                  if ($response.StatusCode -eq 200) {
-                      Start-Process $url
-                      exit 0
-                  }
-              } catch {
-              }
-              Start-Sleep -Milliseconds 500
-          }
-
-          Write-Host "Server chưa mở được sau 60 giây. Hãy xem cửa sổ EAS Fault Insight để đọc lỗi."
-          exit 1
-          '@
-          Set-Content -LiteralPath (Join-Path $dist 'START_EAS_FAULT_EXE.ps1') -Value $launcherPs1 -Encoding utf8
-
-          $launcherCmd = @'
-          @echo off
-          chcp 65001 >nul
-          cd /d "%~dp0"
-          title EAS Fault Insight Launcher
-          powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0START_EAS_FAULT_EXE.ps1"
-          if errorlevel 1 pause
-          '@
-          Set-Content -LiteralPath (Join-Path $dist 'START_EAS_FAULT_EXE.cmd') -Value $launcherCmd -Encoding ascii
-
-      - name: Smoke test compiled EXE
+      - name: Create wheel list and SHA256
+        shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $exePath = Join-Path $env:DIST_DIR 'EAS_Fault_Insight.exe'
-          $stdout = Join-Path $env:RUNNER_TEMP 'eas-stdout.log'
-          $stderr = Join-Path $env:RUNNER_TEMP 'eas-stderr.log'
+          Get-ChildItem "offline_bundle\wheelhouse" -File |
+            Sort-Object Name |
+            Select-Object -ExpandProperty Name |
+            Set-Content "offline_bundle\WHEEL-LIST.txt" -Encoding utf8
 
-          $process = Start-Process `
-            -FilePath $exePath `
-            -WorkingDirectory $env:DIST_DIR `
-            -RedirectStandardOutput $stdout `
-            -RedirectStandardError $stderr `
-            -PassThru
+          Get-ChildItem "offline_bundle\wheelhouse" -File |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+              "$hash  $($_.Name)"
+            } |
+            Set-Content "offline_bundle\SHA256SUMS.txt" -Encoding ascii
 
-          $ready = $false
-          try {
-            for ($i = 0; $i -lt 120; $i++) {
-              $process.Refresh()
-              if ($process.HasExited) { break }
-
-              try {
-                $response = Invoke-WebRequest `
-                  -Uri 'http://127.0.0.1:5000/api/version' `
-                  -UseBasicParsing `
-                  -TimeoutSec 1
-                if ($response.StatusCode -eq 200) {
-                  Write-Host "Smoke test OK: $($response.Content)"
-                  $ready = $true
-                  break
-                }
-              } catch {
-              }
-              Start-Sleep -Milliseconds 500
-            }
-
-            if (!$ready) {
-              Write-Host '----- STDOUT -----'
-              if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout }
-              Write-Host '----- STDERR -----'
-              if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr }
-              throw 'EXE build xong nhưng không khởi động được Flask hoặc thiếu module/data.'
-            }
-          } finally {
-            $process.Refresh()
-            if (!$process.HasExited) {
-              Stop-Process -Id $process.Id -Force
-            }
-          }
-
-      - name: Package standalone output
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $zip = Join-Path $env:GITHUB_WORKSPACE 'EAS_Fault_Insight_V29_Standalone.zip'
-          if (Test-Path -LiteralPath $zip) {
-            Remove-Item -LiteralPath $zip -Force
-          }
-
-          Compress-Archive `
-            -Path (Join-Path $env:DIST_DIR '*') `
-            -DestinationPath $zip `
-            -CompressionLevel Optimal
-
-          if (!(Test-Path -LiteralPath $zip) -or (Get-Item -LiteralPath $zip).Length -lt 1MB) {
-            throw 'ZIP đầu ra không hợp lệ hoặc quá nhỏ.'
-          }
-
-          "OUTPUT_ZIP=$zip" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Output: $zip"
-          Write-Host "Size: $((Get-Item -LiteralPath $zip).Length) bytes"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
+      - name: Upload wheelhouse artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: EAS-Fault-Insight-V29-Standalone-Python-${{ inputs.python_version }}
-          path: ${{ env.OUTPUT_ZIP }}
+          name: wheelhouse-win10-x64-python-3.11.9
+          path: offline_bundle
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
           compression-level: 0
           
