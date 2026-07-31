@@ -1,4 +1,4 @@
-name: Build offline wheels - Windows 10 x64 - Python 3.11.9
+name: Build offline wheels - Win10 x64 - Python 3.11.9
 
 on:
   workflow_dispatch:
@@ -7,9 +7,8 @@ permissions:
   contents: read
 
 jobs:
-  build-wheelhouse:
+  wheelhouse:
     runs-on: windows-2022
-
     steps:
       - name: Setup Python 3.11.9 x64
         uses: actions/setup-python@v6
@@ -17,133 +16,65 @@ jobs:
           python-version: "3.11.9"
           architecture: "x64"
 
-      - name: Upgrade pip tools
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python --version
-          python -m pip --version
-
       - name: Download all wheels and dependencies
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force "offline_bundle\wheelhouse" | Out-Null
-
           @"
           Flask==3.1.3
+          Werkzeug==3.1.6
           mobi==0.4.1
           beautifulsoup4==4.15.0
           waitress==3.0.2
+          PyMuPDF==1.26.7
+          python-docx==1.2.0
+          striprtf==0.0.32
           "@ | Set-Content "offline_bundle\requirements.txt" -Encoding ascii
 
-          python -m pip download `
-            --dest "offline_bundle\wheelhouse" `
-            --only-binary=:all: `
-            pip setuptools wheel
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip download --only-binary=:all: --dest "offline_bundle\wheelhouse" pip setuptools wheel
+          python -m pip download --only-binary=:all: --dest "offline_bundle\wheelhouse" --requirement "offline_bundle\requirements.txt"
 
-          python -m pip download `
-            --dest "offline_bundle\wheelhouse" `
-            --only-binary=:all: `
-            --requirement "offline_bundle\requirements.txt"
-
-      - name: Create offline installer
+      - name: Create installer
         shell: pwsh
         run: |
           @'
           @echo off
           setlocal
           cd /d "%~dp0"
-
-          echo ============================================
-          echo   Offline installer - Python 3.11 x64
-          echo ============================================
-
-          where py >nul 2>nul
-          if errorlevel 1 (
-              echo [ERROR] Khong tim thay Python Launcher.
-              echo Hay cai Python 3.11.9 x64.
-              pause
-              exit /b 1
-          )
-
-          py -3.11 -c "import sys; assert sys.version_info[:2] == (3,11); print(sys.version)"
-          if errorlevel 1 (
-              echo [ERROR] Can Python 3.11.x.
-              pause
-              exit /b 1
-          )
-
-          if not exist ".venv\Scripts\python.exe" (
-              echo [1/4] Tao .venv...
-              py -3.11 -m venv .venv
-              if errorlevel 1 goto :error
-          ) else (
-              echo [1/4] Da co .venv.
-          )
-
-          echo [2/4] Cai pip, setuptools, wheel...
-          ".venv\Scripts\python.exe" -m pip install ^
-            --no-index ^
-            --find-links="%CD%\wheelhouse" ^
-            pip setuptools wheel
-          if errorlevel 1 goto :error
-
-          echo [3/4] Cai thu vien...
-          ".venv\Scripts\python.exe" -m pip install ^
-            --no-index ^
-            --find-links="%CD%\wheelhouse" ^
-            --requirement "%CD%\requirements.txt"
-          if errorlevel 1 goto :error
-
-          echo [4/4] Kiem tra dependency...
-          ".venv\Scripts\python.exe" -m pip check
-          if errorlevel 1 goto :error
-
-          echo.
+          where py >nul 2>nul || (echo Can Python 3.11.9 x64. & pause & exit /b 1)
+          py -3.11 -c "import sys; assert sys.version_info[:2] == (3,11)" || (pause & exit /b 1)
+          if not exist ".venv\Scripts\python.exe" py -3.11 -m venv .venv
+          ".venv\Scripts\python.exe" -m pip install --no-index --find-links="%CD%\wheelhouse" pip setuptools wheel || goto :error
+          ".venv\Scripts\python.exe" -m pip install --no-index --find-links="%CD%\wheelhouse" -r requirements.txt || goto :error
+          ".venv\Scripts\python.exe" -m pip check || goto :error
           echo [OK] Cai offline thanh cong.
           pause
           exit /b 0
-
           :error
-          echo.
-          echo [ERROR] Cai dat that bai.
+          echo [LOI] Cai dat that bai.
           pause
           exit /b 1
           '@ | Set-Content "offline_bundle\install_offline.bat" -Encoding ascii
 
-      - name: Verify offline installation
+      - name: Verify offline bundle
         shell: pwsh
         run: |
           python -m venv verify_venv
-
-          .\verify_venv\Scripts\python.exe -m pip install `
-            --no-index `
-            --find-links="$PWD\offline_bundle\wheelhouse" `
-            --requirement "$PWD\offline_bundle\requirements.txt"
-
+          .\verify_venv\Scripts\python.exe -m pip install --no-index --find-links="$PWD\offline_bundle\wheelhouse" -r "$PWD\offline_bundle\requirements.txt"
           .\verify_venv\Scripts\python.exe -m pip check
-          .\verify_venv\Scripts\python.exe -c "import flask, mobi, bs4, waitress; print('IMPORT OK')"
+          .\verify_venv\Scripts\python.exe -c "import flask,mobi,bs4,waitress,pymupdf,docx,striprtf; print('IMPORT OK')"
 
-      - name: Create wheel list and SHA256
+      - name: Make manifest
         shell: pwsh
         run: |
-          Get-ChildItem "offline_bundle\wheelhouse" -File |
-            Sort-Object Name |
-            Select-Object -ExpandProperty Name |
-            Set-Content "offline_bundle\WHEEL-LIST.txt" -Encoding utf8
+          Get-ChildItem "offline_bundle\wheelhouse" -File | Sort-Object Name | Select-Object -ExpandProperty Name | Set-Content "offline_bundle\WHEEL-LIST.txt" -Encoding utf8
+          Get-ChildItem "offline_bundle\wheelhouse" -File | Sort-Object Name | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content "offline_bundle\SHA256SUMS.txt" -Encoding ascii
 
-          Get-ChildItem "offline_bundle\wheelhouse" -File |
-            Sort-Object Name |
-            ForEach-Object {
-              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-              "$hash  $($_.Name)"
-            } |
-            Set-Content "offline_bundle\SHA256SUMS.txt" -Encoding ascii
-
-      - name: Upload wheelhouse artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheelhouse-win10-x64-python-3.11.9
+          name: lumen-reader-wheelhouse-win10-x64-py3119
           path: offline_bundle
           if-no-files-found: error
           retention-days: 30
