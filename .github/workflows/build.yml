@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v9
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v10
 
 on:
   workflow_dispatch:
@@ -831,6 +831,7 @@ jobs:
               /EHsc `
               /Fe:akira_test.exe `
               $testCpp `
+              -fms-compatibility-version=19.38 `
               -mllvm -irobf-indbr `
               -mllvm -irobf-icall `
               -mllvm -irobf-indgv `
@@ -1025,15 +1026,14 @@ jobs:
       # của CMake vẫn được giữ nguyên.
       # ============================================================
 
-      - name: Configure with Akira clang-cl
+      # ============================================================
+      # 8A. CMAKE/CLANG-CL ABI PREFLIGHT — NO OBFUSCATION
+      # ============================================================
+
+      - name: Preflight CMake clang-cl ABI without obfuscation
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # FIX "MSVC compiler version not detected properly" với CMake 3.31:
-          # INCLUDE/LIB/PATH từ vcvarsall có thể bị lệch encoding khi đi qua
-          # GITHUB_ENV, khiến CMake nhận giá trị rỗng và MSVC version detection
-          # fail. Re-apply vcvarsall vào process hiện tại để cmake child process
-          # kế thừa env vars trực tiếp — không qua file GITHUB_ENV.
           $freshEnv = cmd.exe /d /s /c "`"$env:VCVARS64`" >nul 2>&1 && set"
 
           foreach ($line in $freshEnv) {
@@ -1044,18 +1044,165 @@ jobs:
             }
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:VCToolsVersion)) {
-            throw 're-apply vcvarsall thất bại: VCToolsVersion vẫn rỗng.'
+          if (
+            [string]::IsNullOrWhiteSpace($env:VCToolsVersion) -or
+            !$env:VCToolsVersion.StartsWith("$env:MSVC_TOOLSET_VERSION.")
+          ) {
+            throw (
+              "MSVC 14.38 environment không đúng trước CMake probe. " +
+              "Actual=$env:VCToolsVersion"
+            )
           }
 
-          if (!$env:VCToolsVersion.StartsWith("$env:MSVC_TOOLSET_VERSION.")) {
+          $probe = Join-Path $env:RUNNER_TEMP 'cmake-clangcl-probe'
+
+          if (Test-Path -LiteralPath $probe) {
+            Remove-Item -LiteralPath $probe -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $probe -Force | Out-Null
+
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(ClangClAbiProbe LANGUAGES C CXX)
+
+          message(STATUS "PROBE_C_ID=${CMAKE_C_COMPILER_ID}")
+          message(STATUS "PROBE_CXX_ID=${CMAKE_CXX_COMPILER_ID}")
+          message(STATUS "PROBE_C_SIMULATE_ID=${CMAKE_C_SIMULATE_ID}")
+          message(STATUS "PROBE_CXX_SIMULATE_ID=${CMAKE_CXX_SIMULATE_ID}")
+          message(STATUS "PROBE_C_SIMULATE_VERSION=${CMAKE_C_SIMULATE_VERSION}")
+          message(STATUS "PROBE_CXX_SIMULATE_VERSION=${CMAKE_CXX_SIMULATE_VERSION}")
+          message(STATUS "PROBE_MSVC_VERSION=${MSVC_VERSION}")
+          message(STATUS "PROBE_CXX_FRONTEND=${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}")
+
+          if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+            message(FATAL_ERROR "Expected Clang CXX compiler.")
+          endif()
+
+          if(NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+            message(FATAL_ERROR "clang-cl is not simulating MSVC ABI.")
+          endif()
+
+          if(NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+            message(FATAL_ERROR "clang-cl frontend is not MSVC-like.")
+          endif()
+
+          if(NOT MSVC_VERSION EQUAL 1938)
+            message(FATAL_ERROR "Expected MSVC_VERSION=1938, actual=${MSVC_VERSION}")
+          endif()
+
+          add_executable(clangcl_probe main.cpp)
+          '@ |
+            Out-File `
+              -LiteralPath (Join-Path $probe 'CMakeLists.txt') `
+              -Encoding utf8
+
+          @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+          #include <string>
+
+          static_assert(_MSC_VER == 1938, "Expected _MSC_VER 1938");
+
+          int main()
+          {
+              std::string s = "clang-cl-msvc-abi-ok";
+              return (GetCurrentProcessId() != 0 && !s.empty()) ? 0 : 7;
+          }
+          '@ |
+            Out-File `
+              -LiteralPath (Join-Path $probe 'main.cpp') `
+              -Encoding utf8
+
+          $probeBuild = Join-Path $probe 'build'
+
+          cmake `
+            -S $probe `
+            -B $probeBuild `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_C_COMPILER=$env:AKIRA_CLANGCL" `
+            "-DCMAKE_CXX_COMPILER=$env:AKIRA_CLANGCL" `
+            "-DCMAKE_C_FLAGS=-fms-compatibility-version=19.38" `
+            "-DCMAKE_CXX_FLAGS=-fms-compatibility-version=19.38"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw (
+              "CMake clang-cl ABI probe configure thất bại: $LASTEXITCODE. " +
+              "Dừng trước project thật."
+            )
+          }
+
+          cmake --build $probeBuild --parallel 2
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake clang-cl ABI probe build thất bại: $LASTEXITCODE"
+          }
+
+          $probeExe = Join-Path $probeBuild 'clangcl_probe.exe'
+
+          if (!(Test-Path -LiteralPath $probeExe)) {
+            throw 'CMake ABI probe không tạo được clangcl_probe.exe.'
+          }
+
+          & $probeExe
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake ABI probe runtime thất bại: $LASTEXITCODE"
+          }
+
+          $compilerFile = Get-ChildItem `
+            -LiteralPath (Join-Path $probeBuild 'CMakeFiles') `
+            -Filter 'CMakeCXXCompiler.cmake' `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if ($null -eq $compilerFile) {
+            throw 'Không tìm thấy CMakeCXXCompiler.cmake của probe.'
+          }
+
+          $compilerInfo = Get-Content -LiteralPath $compilerFile.FullName -Raw
+
+          if ($compilerInfo -notmatch 'set\(CMAKE_CXX_SIMULATE_ID "MSVC"\)') {
+            throw 'Probe không ghi CMAKE_CXX_SIMULATE_ID=MSVC.'
+          }
+
+          if ($compilerInfo -notmatch 'set\(CMAKE_CXX_SIMULATE_VERSION "19\.38') {
+            throw 'Probe không ghi CMAKE_CXX_SIMULATE_VERSION=19.38.x.'
+          }
+
+          Write-Host 'CMake clang-cl ABI/compiler-ID probe: OK'
+
+      # ============================================================
+      # 8B. CONFIGURE REAL PROJECT
+      # ============================================================
+
+      - name: Configure with Akira clang-cl
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $freshEnv = cmd.exe /d /s /c "`"$env:VCVARS64`" >nul 2>&1 && set"
+
+          foreach ($line in $freshEnv) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              [System.Environment]::SetEnvironmentVariable(
+                $Matches[1], $Matches[2]
+              )
+            }
+          }
+
+          if (
+            [string]::IsNullOrWhiteSpace($env:VCToolsVersion) -or
+            !$env:VCToolsVersion.StartsWith("$env:MSVC_TOOLSET_VERSION.")
+          ) {
             throw (
               "MSVC toolset sau re-apply không đúng. " +
               "Expected=$env:MSVC_TOOLSET_VERSION.x Actual=$env:VCToolsVersion"
             )
           }
 
-          Write-Host "MSVC env re-applied OK. VCToolsVersion=$env:VCToolsVersion"
+          Write-Host "MSVC env OK. VCToolsVersion=$env:VCToolsVersion"
           Write-Host "VCToolsInstallDir=$env:VCToolsInstallDir"
 
           Set-Location -LiteralPath $env:PROJECT_DIR
@@ -1064,11 +1211,57 @@ jobs:
             Remove-Item -LiteralPath 'build' -Recurse -Force
           }
 
-          $flags = $env:AKIRA_FLAGS.Trim()
+          $inject = Join-Path `
+            $env:RUNNER_TEMP `
+            'SpecialReload_AkiraInject.cmake'
 
-          Write-Host 'Akira project flags:'
-          Write-Host $flags
+          @'
+          # CMake compiler detection must stay unobfuscated.
+          if(PROJECT_NAME STREQUAL "CMAKE_TRY_COMPILE")
+            return()
+          endif()
 
+          if(DEFINED SPECIALRELOAD_AKIRA_INJECTED)
+            return()
+          endif()
+
+          if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+            message(FATAL_ERROR "Akira injection expected Clang.")
+          endif()
+
+          if(NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+            message(FATAL_ERROR "Akira injection expected MSVC ABI simulation.")
+          endif()
+
+          if(NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+            message(FATAL_ERROR "Akira injection expected MSVC-like frontend.")
+          endif()
+
+          if(NOT MSVC_VERSION EQUAL 1938)
+            message(FATAL_ERROR "Akira injection expected MSVC_VERSION 1938, actual=${MSVC_VERSION}")
+          endif()
+
+          set(
+            SPECIALRELOAD_AKIRA_INJECTED
+            TRUE
+            CACHE INTERNAL
+            "Akira flags injected after compiler detection"
+          )
+
+          # Keep all repeated -mllvm pairs together through CMake de-duplication.
+          add_compile_options(
+            "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-mllvm -irobf-indbr -mllvm -irobf-icall -mllvm -irobf-indgv -mllvm -irobf-cse -mllvm -irobf-cff>"
+          )
+
+          message(STATUS "SpecialReloadClient Akira target flags injected AFTER compiler detection")
+          '@ |
+            Out-File `
+              -LiteralPath $inject `
+              -Encoding utf8
+
+          # CRITICAL:
+          # CMAKE_C/CXX_FLAGS contain ONLY compatibility info.
+          # Akira flags are injected after project() enables the compilers.
           cmake `
             -S . `
             -B build `
@@ -1076,40 +1269,43 @@ jobs:
             "-DCMAKE_BUILD_TYPE=${{ inputs.build_config }}" `
             "-DCMAKE_C_COMPILER=$env:AKIRA_CLANGCL" `
             "-DCMAKE_CXX_COMPILER=$env:AKIRA_CLANGCL" `
-            "-DCMAKE_C_FLAGS=$flags" `
-            "-DCMAKE_CXX_FLAGS=$flags" `
-            "-DCMAKE_C_SIMULATE_VERSION=19.38" `
-            "-DCMAKE_CXX_SIMULATE_VERSION=19.38" `
+            "-DCMAKE_C_FLAGS=-fms-compatibility-version=19.38" `
+            "-DCMAKE_CXX_FLAGS=-fms-compatibility-version=19.38" `
+            "-DCMAKE_PROJECT_INCLUDE=$inject" `
             -DBUILD_TESTING=ON
 
           if ($LASTEXITCODE -ne 0) {
             throw "CMake configure với Akira clang-cl thất bại: $LASTEXITCODE"
           }
 
-      - name: Verify CMake selected Akira clang-cl
+      - name: Verify CMake selected Akira and post-detection injection
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $cache = Join-Path `
-            $env:PROJECT_DIR `
-            'build\CMakeCache.txt'
+          $buildDir = Join-Path $env:PROJECT_DIR 'build'
+          $cache = Join-Path $buildDir 'CMakeCache.txt'
 
           if (!(Test-Path -LiteralPath $cache)) {
             throw 'CMakeCache.txt không tồn tại.'
           }
 
-          $content = Get-Content -LiteralPath $cache -Raw
+          $cacheLines = Get-Content -LiteralPath $cache
+          $content = $cacheLines -join "`n"
 
-          $compilerMatch = [regex]::Match(
-            $content,
-            '(?m)^CMAKE_CXX_COMPILER(?::[^=]+)?=(.+)$'
-          )
+          $compilerLine = $cacheLines |
+            Where-Object {
+              $_ -match '^CMAKE_CXX_COMPILER(?::[^=]+)?='
+            } |
+            Select-Object -First 1
 
-          if (!$compilerMatch.Success) {
+          if ($null -eq $compilerLine) {
             throw 'Không đọc được CMAKE_CXX_COMPILER từ CMakeCache.txt.'
           }
 
-          $actualCompiler = $compilerMatch.Groups[1].Value.Trim().Replace('/', '\')
+          $actualCompiler = (
+            $compilerLine -replace '^[^=]+=', ''
+          ).Trim().Replace('/', '\')
+
           $expectedCompiler = (
             Join-Path $env:AKIRA_INSTALL 'bin\clang-cl.exe'
           ).Replace('/', '\')
@@ -1127,7 +1323,59 @@ jobs:
             )
           }
 
-          # Cũng xác nhận flags obfuscation đã lọt vào cache/config.
+          # Base flags must not contain obfuscation.
+          $baseFlagsLines = $cacheLines |
+            Where-Object {
+              $_ -match '^CMAKE_(C|CXX)_FLAGS:'
+            }
+
+          foreach ($line in $baseFlagsLines) {
+            if ($line -match 'irobf-') {
+              throw (
+                "Akira flags vẫn lọt vào CMAKE_*_FLAGS và có thể phá CompilerId: " +
+                $line
+              )
+            }
+          }
+
+          if ($content -notmatch 'SPECIALRELOAD_AKIRA_INJECTED:INTERNAL=TRUE') {
+            throw 'CMake project include chưa inject Akira target flags.'
+          }
+
+          $compilerFile = Get-ChildItem `
+            -LiteralPath (Join-Path $buildDir 'CMakeFiles') `
+            -Filter 'CMakeCXXCompiler.cmake' `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if ($null -eq $compilerFile) {
+            throw 'Không tìm thấy CMakeCXXCompiler.cmake.'
+          }
+
+          $compilerInfo = Get-Content -LiteralPath $compilerFile.FullName -Raw
+
+          foreach ($required in @(
+            'set(CMAKE_CXX_COMPILER_ID "Clang")',
+            'set(CMAKE_CXX_SIMULATE_ID "MSVC")'
+          )) {
+            if (!$compilerInfo.Contains($required)) {
+              throw "Compiler info thiếu: $required"
+            }
+          }
+
+          if ($compilerInfo -notmatch 'set\(CMAKE_CXX_SIMULATE_VERSION "19\.38') {
+            throw 'CMake không detect được MSVC simulate version 19.38.x.'
+          }
+
+          $ninja = Join-Path $buildDir 'build.ninja'
+
+          if (!(Test-Path -LiteralPath $ninja)) {
+            throw 'build.ninja không tồn tại.'
+          }
+
+          $ninjaText = Get-Content -LiteralPath $ninja -Raw
+
           foreach ($flag in @(
             '-irobf-indbr',
             '-irobf-icall',
@@ -1135,12 +1383,33 @@ jobs:
             '-irobf-cse',
             '-irobf-cff'
           )) {
-            if ($content -notmatch [regex]::Escape($flag)) {
-              throw "CMake cache thiếu Akira flag: $flag"
+            if (!$ninjaText.Contains($flag)) {
+              throw "build.ninja thiếu Akira target flag: $flag"
             }
           }
 
-          Write-Host 'Compiler + obfuscation flags gate: OK'
+          # CMake's own detection/try_compile commands must not be obfuscated.
+          $configureLog = Get-ChildItem `
+            -LiteralPath (Join-Path $buildDir 'CMakeFiles') `
+            -Filter 'CMakeConfigureLog.yaml' `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if ($null -ne $configureLog) {
+            $logText = Get-Content -LiteralPath $configureLog.FullName -Raw
+
+            if ($logText -match 'irobf-') {
+              throw (
+                "Akira flags xuất hiện trong CMake configure/try_compile log. " +
+                "Compiler detection chưa được cách ly hoàn toàn."
+              )
+            }
+          }
+
+          Write-Host 'CMake compiler ID: Clang + MSVC ABI 19.38 OK'
+          Write-Host 'CMake probes: NO Akira flags'
+          Write-Host 'Real target build.ninja: all 5 Akira flags PRESENT'
 
       # ============================================================
       # 9. BUILD / TEST
