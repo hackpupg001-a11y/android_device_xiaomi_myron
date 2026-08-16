@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v12
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v13
 
 on:
   workflow_dispatch:
@@ -1101,6 +1101,175 @@ jobs:
           }
 
           Write-Host 'Hardening source gate: OK'
+
+      # ============================================================
+      # 7B. NORMALIZE / VALIDATE PROJECT CMAKE SOURCES
+      #
+      # Some source ZIP revisions carry a stale reference to
+      # SpecialReloadNative.cpp even though the actual entry point is
+      # SpecialReloadClient.cpp. Remove ONLY that known stale token when
+      # the file is absent, then validate every literal .cpp reference.
+      # ============================================================
+
+      - name: Normalize and validate CMake source list
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-Location -LiteralPath $env:PROJECT_DIR
+
+          $cmake = Join-Path $env:PROJECT_DIR 'CMakeLists.txt'
+          $mainName = 'SpecialReloadClient.cpp'
+          $legacyName = 'SpecialReloadNative.cpp'
+          $mainCpp = Join-Path $env:PROJECT_DIR $mainName
+          $legacyCpp = Join-Path $env:PROJECT_DIR $legacyName
+
+          if (!(Test-Path -LiteralPath $cmake)) {
+            throw "Thiếu CMakeLists.txt: $cmake"
+          }
+
+          if (!(Test-Path -LiteralPath $mainCpp)) {
+            throw "Thiếu $mainName: $mainCpp"
+          }
+
+          $cmakeText = Get-Content -LiteralPath $cmake -Raw
+
+          # The current ZIP has SpecialReloadClient.cpp next to CMakeLists.txt,
+          # while an older CMakeLists revision may still name
+          # SpecialReloadNative.cpp. Repair that exact stale filename only.
+          if (
+            $cmakeText.Contains($legacyName) -and
+            !(Test-Path -LiteralPath $legacyCpp)
+          ) {
+            $backup = Join-Path `
+              $env:PROJECT_DIR `
+              'CMakeLists.txt.workflow-backup'
+
+            Copy-Item -LiteralPath $cmake -Destination $backup -Force
+
+            # First check whether the allegedly missing file actually exists
+            # elsewhere in the extracted ZIP. If exactly one copy exists, point
+            # CMake at its real relative path rather than deleting source code.
+            $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'source'
+            $legacyMatches = @(
+              Get-ChildItem `
+                -LiteralPath $sourceRoot `
+                -Filter $legacyName `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue
+            )
+
+            if ($legacyMatches.Count -eq 1) {
+              $relative = [IO.Path]::GetRelativePath(
+                $env:PROJECT_DIR,
+                $legacyMatches[0].FullName
+              ).Replace('\\', '/')
+
+              $cmakeText = $cmakeText.Replace(
+                $legacyName,
+                $relative
+              )
+
+              Write-Host (
+                "Repointed stale $legacyName reference to existing file: " +
+                $relative
+              )
+            }
+            elseif ($legacyMatches.Count -gt 1) {
+              throw (
+                "Tìm thấy nhiều $legacyName trong ZIP; không tự chọn: " +
+                (($legacyMatches.FullName) -join ', ')
+              )
+            }
+            else {
+              # If the new filename is already listed, just remove the stale
+              # old token. Otherwise this is a straight file rename mismatch:
+              # replace old source name with the real new source name.
+              if ($cmakeText.Contains($mainName)) {
+                $cmakeText = $cmakeText.Replace($legacyName, '')
+                Write-Host "Removed duplicate stale source token: $legacyName"
+              }
+              else {
+                $cmakeText = $cmakeText.Replace($legacyName, $mainName)
+                Write-Host "Replaced stale source name: $legacyName -> $mainName"
+              }
+            }
+
+            Set-Content `
+              -LiteralPath $cmake `
+              -Value $cmakeText `
+              -Encoding utf8
+
+            Write-Host "CMake backup: $backup"
+          }
+
+          $cmakeText = Get-Content -LiteralPath $cmake -Raw
+
+          # Collect literal .cpp paths from CMakeLists. Generator expressions
+          # and ${variables} are intentionally ignored here and left to CMake.
+          $matches = [regex]::Matches(
+            $cmakeText,
+            '(?im)(?<![$<A-Za-z0-9_])([A-Za-z0-9_.\\/\-]+\.cpp)(?![A-Za-z0-9_])'
+          )
+
+          $cppRefs = @(
+            $matches |
+              ForEach-Object { $_.Groups[1].Value } |
+              Sort-Object -Unique
+          )
+
+          if ($cppRefs.Count -eq 0) {
+            throw 'CMakeLists.txt không có source .cpp literal nào.'
+          }
+
+          Write-Host '=== Effective CMake .cpp references ==='
+          $cppRefs | ForEach-Object { Write-Host "  $_" }
+
+          $missing = @()
+
+          foreach ($ref in $cppRefs) {
+            $normalized = $ref.Replace(
+              '/',
+              [IO.Path]::DirectorySeparatorChar
+            )
+            $candidate = Join-Path $env:PROJECT_DIR $normalized
+
+            if (!(Test-Path -LiteralPath $candidate)) {
+              $missing += $ref
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Host '=== Project files present ==='
+            Get-ChildItem `
+              -LiteralPath $env:PROJECT_DIR `
+              -File `
+              -Recurse |
+              ForEach-Object {
+                [IO.Path]::GetRelativePath(
+                  $env:PROJECT_DIR,
+                  $_.FullName
+                )
+              } |
+              Sort-Object |
+              Select-Object -First 200 |
+              ForEach-Object { Write-Host "  $_" }
+
+            throw (
+              'CMakeLists.txt còn tham chiếu source không tồn tại: ' +
+              ($missing -join ', ')
+            )
+          }
+
+          if (!$cmakeText.Contains($mainName)) {
+            throw "CMakeLists.txt không reference $mainName sau normalize."
+          }
+
+          Write-Host '=== Effective CMakeLists.txt ==='
+          Get-Content -LiteralPath $cmake |
+            ForEach-Object { Write-Host $_ }
+
+          Write-Host 'CMake source-list validation: OK'
 
       # ============================================================
       # 8. CONFIGURE PROJECT WITH PINNED AKIRA clang-cl
