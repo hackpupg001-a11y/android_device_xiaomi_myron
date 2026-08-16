@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v7
 
 on:
   workflow_dispatch:
@@ -41,7 +41,7 @@ jobs:
       MSVC_TOOLSET_VERSION: "14.38"
 
       # Đổi số này khi muốn ép GitHub Actions rebuild cache compiler.
-      AKIRA_CACHE_VERSION: v6
+      AKIRA_CACHE_VERSION: v7
 
       # Các pass Akira đang hỗ trợ:
       # - indirect branches
@@ -409,7 +409,7 @@ jobs:
             -DLLVM_ENABLE_ASSERTIONS=OFF `
             -DLLVM_ENABLE_PROJECTS="clang" `
             -DLLVM_TARGETS_TO_BUILD="X86" `
-            -DLLVM_ENABLE_DIA_SDK=OFF `
+            -DLLVM_ENABLE_DIA_SDK:BOOL=OFF `
             -DLLVM_INCLUDE_TESTS=OFF `
             -DLLVM_INCLUDE_EXAMPLES=OFF `
             -DLLVM_INCLUDE_BENCHMARKS=OFF `
@@ -429,22 +429,46 @@ jobs:
             throw 'Akira CMakeCache.txt không tồn tại.'
           }
 
-          $cacheText = Get-Content -LiteralPath $cache -Raw
+          # IMPORTANT:
+          # Không kiểm tra CMakeCache bằng Get-Content -Raw + regex "$".
+          # File CMakeCache trên Windows dùng CRLF; regex "...OFF$" sẽ thấy
+          # ký tự \r trước \n và có thể báo FALSE dù giá trị thực là OFF.
+          #
+          # Đọc theo từng line để PowerShell tự bỏ CR/LF.
+          $cacheLines = Get-Content -LiteralPath $cache
 
-          if ($cacheText -notmatch '(?m)^LLVM_ENABLE_DIA_SDK:BOOL=OFF$') {
-            throw 'LLVM_ENABLE_DIA_SDK không phải OFF — dừng để tránh kéo DIA/ATL.'
+          $diaLine = $cacheLines |
+            Where-Object {
+              $_ -like 'LLVM_ENABLE_DIA_SDK:*'
+            } |
+            Select-Object -First 1
+
+          if ($null -eq $diaLine) {
+            throw 'CMakeCache không có LLVM_ENABLE_DIA_SDK.'
           }
 
-          $compilerMatch = [regex]::Match(
-            $cacheText,
-            '(?m)^CMAKE_CXX_COMPILER(?::[^=]+)?=(.+)$'
-          )
+          Write-Host "CMake cache DIA: $diaLine"
 
-          if (!$compilerMatch.Success) {
-            throw 'Không đọc được CMAKE_CXX_COMPILER của Akira build.'
+          if ($diaLine -ne 'LLVM_ENABLE_DIA_SDK:BOOL=OFF') {
+            throw (
+              "LLVM_ENABLE_DIA_SDK không phải BOOL=OFF. " +
+              "Actual='$diaLine'"
+            )
           }
 
-          $akiraHostCompiler = $compilerMatch.Groups[1].Value.Trim().Replace('/', '\')
+          $compilerLine = $cacheLines |
+            Where-Object {
+              $_ -match '^CMAKE_CXX_COMPILER(?::[^=]+)?='
+            } |
+            Select-Object -First 1
+
+          if ($null -eq $compilerLine) {
+            throw 'Không đọc được CMAKE_CXX_COMPILER từ CMakeCache.'
+          }
+
+          $akiraHostCompiler = (
+            $compilerLine -replace '^[^=]+=', ''
+          ).Trim().Replace('/', '\')
 
           if (
             $akiraHostCompiler -notlike "$env:VS178_INSTALL\VC\Tools\MSVC\14.38.*\bin\Hostx64\x64\cl.exe"
@@ -477,6 +501,15 @@ jobs:
           Write-Host 'LLVM DIA SDK: OFF'
           Write-Host 'DIA sources/include paths in build.ninja: NONE'
 
+          Write-Host '=== Critical CMake cache values ==='
+          $cacheLines |
+            Where-Object {
+              $_ -match '^(LLVM_ENABLE_DIA_SDK|CMAKE_CXX_COMPILER|LLVM_ENABLE_PROJECTS|LLVM_TARGETS_TO_BUILD):'
+            } |
+            ForEach-Object {
+              Write-Host $_
+            }
+
       - name: Preflight Akira critical LLVM targets
         if: steps.akira-cache.outputs.cache-hit != 'true'
         run: |
@@ -503,7 +536,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw (
               "Akira critical-target preflight thất bại: $LASTEXITCODE. " +
-              "Dừng trước khi build full clang."
+              "DIA đã được xác nhận OFF trước bước này; xem dòng FAILED đầu tiên " +
+              "để biết dependency thật sự còn thiếu. Dừng trước full clang."
             )
           }
 
