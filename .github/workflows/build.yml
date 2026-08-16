@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v15
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v16
 
 on:
   workflow_dispatch:
@@ -1279,6 +1279,287 @@ jobs:
       # Akira passes được inject sau compiler detection.
       # ============================================================
 
+      - name: Resolve and validate quoted local headers
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $project = $env:PROJECT_DIR
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'source'
+
+          if (!(Test-Path -LiteralPath $project)) {
+            throw "PROJECT_DIR không tồn tại: $project"
+          }
+
+          if (!(Test-Path -LiteralPath $sourceRoot)) {
+            throw "Source root không tồn tại: $sourceRoot"
+          }
+
+          $codeExts = @(
+            '.c', '.cc', '.cpp', '.cxx',
+            '.h', '.hh', '.hpp', '.hxx', '.inl'
+          )
+
+          $codeFiles = @(
+            Get-ChildItem `
+              -LiteralPath $project `
+              -File `
+              -Recurse |
+            Where-Object {
+              $codeExts -contains $_.Extension.ToLowerInvariant()
+            }
+          )
+
+          if ($codeFiles.Count -eq 0) {
+            throw 'Không tìm thấy C/C++ source/header trong PROJECT_DIR.'
+          }
+
+          $allHeaders = @(
+            Get-ChildItem `
+              -LiteralPath $sourceRoot `
+              -File `
+              -Recurse |
+            Where-Object {
+              @('.h', '.hh', '.hpp', '.hxx', '.inl') -contains
+                $_.Extension.ToLowerInvariant()
+            }
+          )
+
+          $extraIncludeDirs = New-Object System.Collections.Generic.List[string]
+          $missing = New-Object System.Collections.Generic.List[string]
+          $ambiguous = New-Object System.Collections.Generic.List[string]
+
+          foreach ($file in $codeFiles) {
+            $fileText = Get-Content `
+              -LiteralPath $file.FullName `
+              -Raw `
+              -ErrorAction Stop
+
+            $includes = [regex]::Matches(
+              $fileText,
+              '(?m)^\s*#\s*include\s*"([^"]+)"'
+            )
+
+            foreach ($match in $includes) {
+              $includeText = $match.Groups[1].Value.Trim()
+
+              if ([string]::IsNullOrWhiteSpace($includeText)) {
+                continue
+              }
+
+              # 1) Standard quoted-include behavior: relative to including file.
+              $relativeToFile = Join-Path `
+                $file.Directory.FullName `
+                ($includeText.Replace(
+                  '/',
+                  [IO.Path]::DirectorySeparatorChar
+                ))
+
+              if (Test-Path -LiteralPath $relativeToFile) {
+                continue
+              }
+
+              # 2) Also accept an include rooted at PROJECT_DIR.
+              $relativeToProject = Join-Path `
+                $project `
+                ($includeText.Replace(
+                  '/',
+                  [IO.Path]::DirectorySeparatorChar
+                ))
+
+              if (Test-Path -LiteralPath $relativeToProject) {
+                continue
+              }
+
+              $includeUnix = $includeText.Replace('\', '/')
+              $leaf = [IO.Path]::GetFileName($includeText)
+
+              # Prefer a unique exact suffix match, e.g.
+              # include "net/NativeHttp.h" -> .../include/net/NativeHttp.h
+              $suffixMatches = @(
+                $allHeaders |
+                Where-Object {
+                  $rel = [IO.Path]::GetRelativePath(
+                    $sourceRoot,
+                    $_.FullName
+                  ).Replace('\', '/')
+
+                  $rel.EndsWith(
+                    $includeUnix,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                  )
+                }
+              )
+
+              $chosen = $null
+
+              if ($suffixMatches.Count -eq 1) {
+                $chosen = $suffixMatches[0]
+              }
+              elseif ($suffixMatches.Count -gt 1) {
+                $ambiguous.Add(
+                  (
+                    "{0} <- {1}: {2}" -f
+                    $includeText,
+                    [IO.Path]::GetRelativePath($project, $file.FullName),
+                    (($suffixMatches.FullName) -join ' | ')
+                  )
+                )
+                continue
+              }
+              else {
+                # Fall back to basename only when it is globally unique.
+                $basenameMatches = @(
+                  $allHeaders |
+                  Where-Object {
+                    $_.Name.Equals(
+                      $leaf,
+                      [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                  }
+                )
+
+                if ($basenameMatches.Count -eq 1) {
+                  $chosen = $basenameMatches[0]
+                }
+                elseif ($basenameMatches.Count -gt 1) {
+                  $ambiguous.Add(
+                    (
+                      "{0} <- {1}: {2}" -f
+                      $includeText,
+                      [IO.Path]::GetRelativePath($project, $file.FullName),
+                      (($basenameMatches.FullName) -join ' | ')
+                    )
+                  )
+                  continue
+                }
+              }
+
+              if ($null -eq $chosen) {
+                $missing.Add(
+                  (
+                    "{0} <- {1}" -f
+                    $includeText,
+                    [IO.Path]::GetRelativePath($project, $file.FullName)
+                  )
+                )
+                continue
+              }
+
+              # Derive the include root that makes the original quoted include
+              # resolve without rewriting user source.
+              $includeNative = $includeText.Replace(
+                '/',
+                [IO.Path]::DirectorySeparatorChar
+              )
+
+              $chosenFull = $chosen.FullName
+
+              if (
+                $chosenFull.EndsWith(
+                  $includeNative,
+                  [System.StringComparison]::OrdinalIgnoreCase
+                )
+              ) {
+                $includeRoot = $chosenFull.Substring(
+                  0,
+                  $chosenFull.Length - $includeNative.Length
+                ).TrimEnd('\')
+              }
+              else {
+                # Basename-only unique match.
+                $includeRoot = $chosen.Directory.FullName
+              }
+
+              if ([string]::IsNullOrWhiteSpace($includeRoot)) {
+                $includeRoot = $chosen.Directory.FullName
+              }
+
+              if (!$extraIncludeDirs.Contains($includeRoot)) {
+                $extraIncludeDirs.Add($includeRoot)
+              }
+
+              Write-Host (
+                "Resolved local include '{0}' from '{1}' via include dir '{2}'" -f
+                $includeText,
+                [IO.Path]::GetRelativePath($project, $file.FullName),
+                $includeRoot
+              )
+            }
+          }
+
+          if ($ambiguous.Count -gt 0) {
+            Write-Host '=== Ambiguous local includes ==='
+            $ambiguous |
+              Sort-Object -Unique |
+              ForEach-Object {
+                Write-Host ("  {0}" -f $_)
+              }
+
+            throw (
+              'Có local header trùng tên ở nhiều vị trí; workflow không tự đoán.'
+            )
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Host '=== Missing local headers ==='
+            $missing |
+              Sort-Object -Unique |
+              ForEach-Object {
+                Write-Host ("  {0}" -f $_)
+              }
+
+            Write-Host '=== Header files actually present in extracted source ==='
+            $allHeaders |
+              ForEach-Object {
+                [IO.Path]::GetRelativePath(
+                  $sourceRoot,
+                  $_.FullName
+                )
+              } |
+              Sort-Object |
+              Select-Object -First 300 |
+              ForEach-Object {
+                Write-Host ("  {0}" -f $_)
+              }
+
+            throw (
+              'Source ZIP thiếu local header bắt buộc. ' +
+              'Không tạo header giả vì sẽ có nguy cơ sai declaration/ABI.'
+            )
+          }
+
+          $resolvedDirs = @(
+            $extraIncludeDirs |
+              Sort-Object -Unique
+          )
+
+          if ($resolvedDirs.Count -gt 0) {
+            $joined = $resolvedDirs -join ';'
+
+            "SPECIALRELOAD_EXTRA_INCLUDE_DIRS=$joined" |
+              Out-File `
+                $env:GITHUB_ENV `
+                -Encoding utf8 `
+                -Append
+
+            Write-Host '=== Extra include directories resolved ==='
+            $resolvedDirs |
+              ForEach-Object {
+                Write-Host ("  {0}" -f $_)
+              }
+          }
+          else {
+            "SPECIALRELOAD_EXTRA_INCLUDE_DIRS=" |
+              Out-File `
+                $env:GITHUB_ENV `
+                -Encoding utf8 `
+                -Append
+
+            Write-Host 'All quoted local includes already resolve normally.'
+          }
+
+          Write-Host 'Quoted local-header validation: OK'
+
       - name: Sanitize MSVC-only flags for clang-cl
         run: |
           $ErrorActionPreference = 'Stop'
@@ -1634,6 +1915,28 @@ jobs:
             "Akira flags injected after compiler detection"
           )
 
+          # Add any include roots resolved by the workflow. This happens after
+          # compiler detection but before targets are created in CMakeLists.txt.
+          if(
+            DEFINED ENV{SPECIALRELOAD_EXTRA_INCLUDE_DIRS}
+            AND NOT "$ENV{SPECIALRELOAD_EXTRA_INCLUDE_DIRS}" STREQUAL ""
+          )
+            set(
+              _specialreload_extra_include_dirs
+              "$ENV{SPECIALRELOAD_EXTRA_INCLUDE_DIRS}"
+            )
+
+            include_directories(
+              BEFORE
+              ${_specialreload_extra_include_dirs}
+            )
+
+            message(
+              STATUS
+              "SpecialReloadClient resolved include dirs: ${_specialreload_extra_include_dirs}"
+            )
+          endif()
+
           # Keep all repeated -mllvm pairs together through CMake de-duplication.
           add_compile_options(
             "$<$<COMPILE_LANGUAGE:CXX>:SHELL:/clang:-mllvm /clang:-irobf-indbr /clang:-mllvm /clang:-irobf-icall /clang:-mllvm /clang:-irobf-indgv /clang:-mllvm /clang:-irobf-cse /clang:-mllvm /clang:-irobf-cff>"
@@ -1798,6 +2101,36 @@ jobs:
           }
 
           Write-Host 'Known MSVC-only clang-cl flags in build.ninja: NONE'
+
+          if (
+            ![string]::IsNullOrWhiteSpace(
+              $env:SPECIALRELOAD_EXTRA_INCLUDE_DIRS
+            )
+          ) {
+            $resolvedIncludeDirs = @(
+              $env:SPECIALRELOAD_EXTRA_INCLUDE_DIRS -split ';' |
+                Where-Object {
+                  ![string]::IsNullOrWhiteSpace($_)
+                }
+            )
+
+            foreach ($dir in $resolvedIncludeDirs) {
+              $slashPath = $dir.Replace('\', '/')
+              $backPath = $dir.Replace('/', '\')
+
+              if (
+                !$ninjaText.Contains($slashPath) -and
+                !$ninjaText.Contains($backPath)
+              ) {
+                throw (
+                  "Resolved include dir không xuất hiện trong build.ninja: " +
+                  $dir
+                )
+              }
+            }
+
+            Write-Host 'Resolved local include dirs in build.ninja: PRESENT'
+          }
 
           # CMake's own detection/try_compile commands must not be obfuscated.
           $configureLog = Get-ChildItem `
