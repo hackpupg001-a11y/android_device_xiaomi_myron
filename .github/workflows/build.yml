@@ -1,82 +1,241 @@
-name: Build offline wheels - Win10 x64 - Python 3.11.9
+name: Build SpecialReloadClient (C++) from Google Drive
 
 on:
   workflow_dispatch:
+    inputs:
+      drive_url:
+        description: "Google Drive file ID hoặc link chia sẻ ZIP source SpecialReloadClient (C++)"
+        required: true
+        type: string
+      build_config:
+        description: "Cấu hình build"
+        required: true
+        default: "Release"
+        type: choice
+        options:
+          - "Release"
 
 permissions:
   contents: read
 
 jobs:
-  wheelhouse:
+  build-windows:
+    # Cố định VS 2022 (MSVC toolset đi kèm sẵn), tránh windows-latest đổi image
+    # ngầm làm lệch toolchain giữa các lần build.
     runs-on: windows-2022
+    timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: pwsh
+
     steps:
-      - name: Setup Python 3.11.9 x64
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11.9"
-          architecture: "x64"
-
-      - name: Download all wheels and dependencies
-        shell: pwsh
+      - name: Install download tool
         run: |
-          New-Item -ItemType Directory -Force "offline_bundle\wheelhouse" | Out-Null
-          @"
-          Flask==3.1.3
-          Werkzeug==3.1.6
-          mobi==0.4.1
-          beautifulsoup4==4.15.0
-          waitress==3.0.2
-          PyMuPDF==1.26.7
-          python-docx==1.2.0
-          striprtf==0.0.32
-          "@ | Set-Content "offline_bundle\requirements.txt" -Encoding ascii
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --upgrade pip
+          python -m pip install "gdown>=5.2,<6"
 
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip download --only-binary=:all: --dest "offline_bundle\wheelhouse" pip setuptools wheel
-          python -m pip download --only-binary=:all: --dest "offline_bundle\wheelhouse" --requirement "offline_bundle\requirements.txt"
-
-      - name: Create installer
-        shell: pwsh
+      - name: Download source ZIP from Google Drive
+        env:
+          DRIVE_URL: ${{ inputs.drive_url }}
         run: |
-          @'
-          @echo off
-          setlocal
-          cd /d "%~dp0"
-          where py >nul 2>nul || (echo Can Python 3.11.9 x64. & pause & exit /b 1)
-          py -3.11 -c "import sys; assert sys.version_info[:2] == (3,11)" || (pause & exit /b 1)
-          if not exist ".venv\Scripts\python.exe" py -3.11 -m venv .venv
-          ".venv\Scripts\python.exe" -m pip install --no-index --find-links="%CD%\wheelhouse" pip setuptools wheel || goto :error
-          ".venv\Scripts\python.exe" -m pip install --no-index --find-links="%CD%\wheelhouse" -r requirements.txt || goto :error
-          ".venv\Scripts\python.exe" -m pip check || goto :error
-          echo [OK] Cai offline thanh cong.
-          pause
-          exit /b 0
-          :error
-          echo [LOI] Cai dat that bai.
-          pause
-          exit /b 1
-          '@ | Set-Content "offline_bundle\install_offline.bat" -Encoding ascii
+          $ErrorActionPreference = 'Stop'
+          $driveInput = $env:DRIVE_URL.Trim()
 
-      - name: Verify offline bundle
-        shell: pwsh
-        run: |
-          python -m venv verify_venv
-          .\verify_venv\Scripts\python.exe -m pip install --no-index --find-links="$PWD\offline_bundle\wheelhouse" -r "$PWD\offline_bundle\requirements.txt"
-          .\verify_venv\Scripts\python.exe -m pip check
-          .\verify_venv\Scripts\python.exe -c "import flask,mobi,bs4,waitress,pymupdf,docx,striprtf; print('IMPORT OK')"
+          if ($driveInput -match '^[A-Za-z0-9_-]{20,}$') {
+            $fileId = $driveInput
+          } elseif ($driveInput -match '/d/([A-Za-z0-9_-]+)') {
+            $fileId = $Matches[1]
+          } elseif ($driveInput -match '[?&]id=([A-Za-z0-9_-]+)') {
+            $fileId = $Matches[1]
+          } else {
+            throw 'Không lấy được Google Drive file ID. Hãy nhập file ID hoặc link chia sẻ ZIP.'
+          }
 
-      - name: Make manifest
-        shell: pwsh
+          python -c "import gdown,sys,os; p=gdown.download(id=sys.argv[1], output='source.zip', quiet=False); raise SystemExit(0 if p and os.path.isfile(p) and os.path.getsize(p)>1024 else 1)" "$fileId"
+
+          if (!(Test-Path -LiteralPath source.zip)) {
+            throw 'Không tải được source.zip'
+          }
+
+          $zipSize = (Get-Item -LiteralPath source.zip).Length
+          Write-Host "Downloaded source.zip: $zipSize bytes"
+
+          New-Item -ItemType Directory -Path source -Force | Out-Null
+          Expand-Archive -LiteralPath source.zip -DestinationPath source -Force
+
+      - name: Locate CMake project
         run: |
-          Get-ChildItem "offline_bundle\wheelhouse" -File | Sort-Object Name | Select-Object -ExpandProperty Name | Set-Content "offline_bundle\WHEEL-LIST.txt" -Encoding utf8
-          Get-ChildItem "offline_bundle\wheelhouse" -File | Sort-Object Name | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content "offline_bundle\SHA256SUMS.txt" -Encoding ascii
+          $ErrorActionPreference = 'Stop'
+
+          $cmakeFile = Get-ChildItem source -Filter CMakeLists.txt -File -Recurse |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](build|\.git)[\\/]' -and
+              (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'SpecialReloadClient.cpp'))
+            } |
+            Sort-Object { $_.FullName.Length } |
+            Select-Object -First 1
+
+          if ($null -eq $cmakeFile) {
+            throw 'Không tìm thấy CMakeLists.txt cạnh SpecialReloadClient.cpp trong ZIP.'
+          }
+
+          $project = $cmakeFile.Directory.FullName
+          "PROJECT_DIR=$project" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Project: $project"
+          Get-ChildItem -LiteralPath $project | Format-Table Name, Length, LastWriteTime
+
+      - name: Verify hardening sources are present
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location -LiteralPath $env:PROJECT_DIR
+
+          # Nếu ai đó push một bản source thiếu StringObf.h/AntiDebug.h (vô tình
+          # hoặc do revert), build phải fail ngay ở đây thay vì âm thầm ra một
+          # EXE yếu hơn bản đã hardened.
+          foreach ($required in @('StringObf.h', 'AntiDebug.h')) {
+            if (!(Test-Path -LiteralPath $required)) {
+              throw "Thiếu $required — source ZIP này không phải bản đã hardened."
+            }
+          }
+
+          $needle = 'OBF("/api/specialreload/register")'
+          if (!(Select-String -LiteralPath 'SpecialReloadClient.cpp' -Pattern ([regex]::Escape($needle)) -Quiet)) {
+            throw 'SpecialReloadClient.cpp không dùng OBF() cho endpoint register — hardening bị revert?'
+          }
+
+      - name: Configure (CMake + MSVC x64)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location -LiteralPath $env:PROJECT_DIR
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+
+      - name: Build ${{ inputs.build_config }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location -LiteralPath $env:PROJECT_DIR
+          cmake --build build --config ${{ inputs.build_config }} -- /m
+
+          $exe = Get-ChildItem build -Filter SpecialReloadClient.exe -File -Recurse |
+            Select-Object -First 1
+          if ($null -eq $exe) {
+            throw 'Build xong nhưng không thấy SpecialReloadClient.exe.'
+          }
+          "EXE_PATH=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "EXE: $($exe.FullName)"
+
+      - name: Run --self-test
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:EXE_PATH --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "--self-test thất bại (exit code $LASTEXITCODE)."
+          }
+
+      - name: Run ctest suite
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location -LiteralPath (Join-Path $env:PROJECT_DIR 'build')
+          ctest -C ${{ inputs.build_config }} --output-on-failure
+
+      - name: Security gate — no plaintext API surface, no CLR/PDB leak
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1) Đọc EXE dạng Latin1 để soi các chuỗi ASCII plaintext không được
+          #    phép lộ trong bản đã hardened. Đây là bản CI của cùng check
+          #    `strings | grep` đã chạy tay lúc review source.
+          $bytes = [System.IO.File]::ReadAllBytes($env:EXE_PATH)
+          $text = [System.Text.Encoding]::Latin1.GetString($bytes)
+
+          $forbidden = @(
+            '/api/specialreload/register',
+            '/api/specialreload/poll',
+            '/api/specialreload/status',
+            'X-ICM-Client-Token'
+          )
+          $leaked = @()
+          foreach ($needle in $forbidden) {
+            if ($text.Contains($needle)) { $leaked += $needle }
+          }
+          if ($leaked.Count -gt 0) {
+            throw "Phát hiện chuỗi plaintext không nên có trong EXE: $($leaked -join ', ')"
+          }
+          Write-Host "OK: không rò rỉ API surface plaintext."
+
+          # 2) Không có CLR header (đảm bảo đây là native, không lỡ link managed).
+          $dumpbin = & where.exe dumpbin 2>$null | Select-Object -First 1
+          if ($dumpbin) {
+            $headers = & dumpbin /headers $env:EXE_PATH
+            if ($headers -match 'COM Descriptor') {
+              throw 'EXE có CLR/COM descriptor header — không phải native thuần.'
+            }
+          }
+
+          # 3) Không phát tán .pdb cùng EXE (không có trong output dir này theo
+          #    thiết kế — cấu hình Release hiện tại không bật /Zi/DEBUG).
+          $exeDir = Split-Path -Parent $env:EXE_PATH
+          $pdbs = Get-ChildItem -LiteralPath $exeDir -Filter *.pdb -File -ErrorAction SilentlyContinue
+          if ($pdbs) {
+            throw "Có file .pdb trong thư mục output ($($pdbs.Name -join ', ')) — sẽ leak path/symbol nếu đóng gói kèm."
+          }
+
+      - name: Package release folder
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exeDir = Split-Path -Parent $env:EXE_PATH
+          $stageDir = Join-Path $env:GITHUB_WORKSPACE 'stage'
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+          Copy-Item -LiteralPath $env:EXE_PATH -Destination $stageDir -Force
+
+          $cfgTemplate = Join-Path $env:PROJECT_DIR 'reloader.cfg'
+          if (Test-Path -LiteralPath $cfgTemplate) {
+            Copy-Item -LiteralPath $cfgTemplate -Destination $stageDir -Force
+          }
+          foreach ($doc in @('README_HARDENING.md', 'HARDENING_ADDENDUM.md')) {
+            $docPath = Join-Path $env:PROJECT_DIR $doc
+            if (Test-Path -LiteralPath $docPath) {
+              Copy-Item -LiteralPath $docPath -Destination $stageDir -Force
+            }
+          }
+
+          # SHA256 để đối chiếu khi cutover (README section 5.4 / 9.2 yêu cầu
+          # checksum kèm release manifest).
+          $hash = Get-FileHash -LiteralPath (Join-Path $stageDir 'SpecialReloadClient.exe') -Algorithm SHA256
+          "$($hash.Hash)  SpecialReloadClient.exe" | Out-File (Join-Path $stageDir 'SHA256SUMS.txt') -Encoding ascii
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'SpecialReloadClient_release.zip'
+          if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+          Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zip -CompressionLevel Optimal
+
+          "OUTPUT_ZIP=$zip" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "SHA256: $($hash.Hash)"
+
+      # Authenticode signing (khuyến nghị bắt buộc trước khi phát hành theo
+      # README section 10/13). Cần secrets.CODE_SIGN_PFX (base64) +
+      # secrets.CODE_SIGN_PASSWORD; bỏ qua nếu chưa cấu hình secret.
+      - name: Authenticode sign (optional)
+        if: ${{ secrets.CODE_SIGN_PFX != '' }}
+        env:
+          CODE_SIGN_PFX: ${{ secrets.CODE_SIGN_PFX }}
+          CODE_SIGN_PASSWORD: ${{ secrets.CODE_SIGN_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODE_SIGN_PFX))
+          & signtool sign /f $pfxPath /p $env:CODE_SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $env:EXE_PATH
+          & signtool verify /pa $env:EXE_PATH
+          Remove-Item -LiteralPath $pfxPath -Force
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: lumen-reader-wheelhouse-win10-x64-py3119
-          path: offline_bundle
+          name: SpecialReloadClient-${{ inputs.build_config }}
+          path: ${{ env.OUTPUT_ZIP }}
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
           compression-level: 0
           
