@@ -1029,6 +1029,35 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
+          # FIX "MSVC compiler version not detected properly" với CMake 3.31:
+          # INCLUDE/LIB/PATH từ vcvarsall có thể bị lệch encoding khi đi qua
+          # GITHUB_ENV, khiến CMake nhận giá trị rỗng và MSVC version detection
+          # fail. Re-apply vcvarsall vào process hiện tại để cmake child process
+          # kế thừa env vars trực tiếp — không qua file GITHUB_ENV.
+          $freshEnv = cmd.exe /d /s /c "`"$env:VCVARS64`" >nul 2>&1 && set"
+
+          foreach ($line in $freshEnv) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              [System.Environment]::SetEnvironmentVariable(
+                $Matches[1], $Matches[2]
+              )
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:VCToolsVersion)) {
+            throw 're-apply vcvarsall thất bại: VCToolsVersion vẫn rỗng.'
+          }
+
+          if (!$env:VCToolsVersion.StartsWith("$env:MSVC_TOOLSET_VERSION.")) {
+            throw (
+              "MSVC toolset sau re-apply không đúng. " +
+              "Expected=$env:MSVC_TOOLSET_VERSION.x Actual=$env:VCToolsVersion"
+            )
+          }
+
+          Write-Host "MSVC env re-applied OK. VCToolsVersion=$env:VCToolsVersion"
+          Write-Host "VCToolsInstallDir=$env:VCToolsInstallDir"
+
           Set-Location -LiteralPath $env:PROJECT_DIR
 
           if (Test-Path -LiteralPath 'build') {
