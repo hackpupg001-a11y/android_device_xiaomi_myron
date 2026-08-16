@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v11
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v12
 
 on:
   workflow_dispatch:
@@ -803,7 +803,7 @@ jobs:
             & $env:AKIRA_CLANGCL `
               /nologo `
               /c `
-              /Fo:driver_probe.obj `
+              /Fodriver_probe.obj `
               $srcFile `
               /clang:-fms-compatibility-version=19.38
 
@@ -815,9 +815,21 @@ jobs:
             }
 
             if (!(Test-Path -LiteralPath 'driver_probe.obj')) {
+              Write-Host 'Files created by clang-cl:'
+              Get-ChildItem -LiteralPath . -Force |
+                Select-Object Name, Length |
+                Format-Table
+
               throw 'clang-cl forwarding test không tạo driver_probe.obj.'
             }
 
+            $objSize = (Get-Item -LiteralPath 'driver_probe.obj').Length
+
+            if ($objSize -le 0) {
+              throw 'driver_probe.obj được tạo nhưng rỗng.'
+            }
+
+            Write-Host "driver_probe.obj: $objSize bytes"
             Write-Host 'clang-cl /clang:-fms-compatibility-version=19.38: OK'
           }
           finally {
@@ -888,7 +900,7 @@ jobs:
               /nologo `
               /O2 `
               /EHsc `
-              /Fe:akira_test.exe `
+              /Feakira_test.exe `
               $testCpp `
               /clang:-fms-compatibility-version=19.38 `
               /clang:-mllvm /clang:-irobf-indbr `
@@ -902,8 +914,21 @@ jobs:
             }
 
             if (!(Test-Path -LiteralPath 'akira_test.exe')) {
+              Write-Host 'Files created by Akira pass compile:'
+              Get-ChildItem -LiteralPath . -Force |
+                Select-Object Name, Length |
+                Format-Table
+
               throw 'Không tạo được akira_test.exe.'
             }
+
+            $akiraTestSize = (Get-Item -LiteralPath 'akira_test.exe').Length
+
+            if ($akiraTestSize -le 1024) {
+              throw "akira_test.exe bất thường: $akiraTestSize bytes."
+            }
+
+            Write-Host "akira_test.exe: $akiraTestSize bytes"
 
             & .\akira_test.exe
 
