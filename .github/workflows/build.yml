@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 Hardened
+name: Build SpecialReloadClient - Akira LLVM17 + MSVC 14.38
 
 on:
   workflow_dispatch:
@@ -32,6 +32,12 @@ jobs:
       AKIRA_REPO: https://github.com/thomasxm/Akira-obfuscator.git
       AKIRA_COMMIT: 112e63dadff9d1b81a65b24b1a16a03f56d63a0f
       AKIRA_INSTALL: C:\AkiraLLVM17
+
+      # Akira này là LLVM/Clang 17. MSVC STL mới trên windows-2022
+      # hiện yêu cầu Clang mới hơn, vì vậy pin STL/toolset VS 17.8
+      # (MSVC 14.38), là dòng tương thích với Clang 17.
+      MSVC_TOOLSET_VERSION: "14.38"
+      MSVC_TOOLSET_COMPONENT: Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64
 
       # Đổi số này khi muốn ép GitHub Actions rebuild cache compiler.
       AKIRA_CACHE_VERSION: v3
@@ -123,13 +129,81 @@ jobs:
 
           Write-Host "Visual Studio: $vsPath"
 
-      - name: Initialize VS2022 x64 environment
+      - name: Ensure MSVC 14.38 toolset for Clang 17
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $envFile = Join-Path $env:RUNNER_TEMP 'vs2022_env.txt'
+          $msvcRoot = Join-Path $env:VS_PATH 'VC\Tools\MSVC'
 
-          cmd.exe /d /s /c "`"$env:VCVARS64`" >nul && set" |
+          $toolset = Get-ChildItem `
+            -LiteralPath $msvcRoot `
+            -Directory `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -like "$env:MSVC_TOOLSET_VERSION.*"
+            } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+
+          if ($null -eq $toolset) {
+            Write-Host "MSVC $env:MSVC_TOOLSET_VERSION chưa có; cài component tương thích Clang 17..."
+
+            $setup = Join-Path `
+              ${env:ProgramFiles(x86)} `
+              'Microsoft Visual Studio\Installer\setup.exe'
+
+            if (!(Test-Path -LiteralPath $setup)) {
+              throw 'Không tìm thấy Visual Studio Installer setup.exe.'
+            }
+
+            $args = @(
+              'modify',
+              '--installPath', $env:VS_PATH,
+              '--add', $env:MSVC_TOOLSET_COMPONENT,
+              '--quiet',
+              '--norestart'
+            )
+
+            $proc = Start-Process `
+              -FilePath $setup `
+              -ArgumentList $args `
+              -Wait `
+              -PassThru `
+              -NoNewWindow
+
+            # VS Installer thường dùng 0 = success, 3010 = success/reboot required.
+            if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+              throw "Cài MSVC 14.38 thất bại. Exit code: $($proc.ExitCode)"
+            }
+
+            $toolset = Get-ChildItem `
+              -LiteralPath $msvcRoot `
+              -Directory `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Name -like "$env:MSVC_TOOLSET_VERSION.*"
+              } |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+          }
+
+          if ($null -eq $toolset) {
+            throw 'Đã chạy installer nhưng vẫn không tìm thấy MSVC 14.38.'
+          }
+
+          "MSVC_TOOLSET_FULL_VERSION=$($toolset.Name)" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "MSVC toolset selected: $($toolset.Name)"
+
+      - name: Initialize VS2022 x64 environment with MSVC 14.38
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $envFile = Join-Path $env:RUNNER_TEMP 'vs2022_1438_env.txt'
+
+          # vcvars64.bat nhận -vcvars_ver để chọn toolset side-by-side.
+          cmd.exe /d /s /c "`"$env:VCVARS64`" -vcvars_ver=$env:MSVC_TOOLSET_VERSION >nul && set" |
             Out-File `
               -LiteralPath $envFile `
               -Encoding ascii
@@ -160,13 +234,45 @@ jobs:
 
           Remove-Item -LiteralPath $envFile -Force
 
+      - name: Verify MSVC 14.38 environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "VCToolsVersion: $env:VCToolsVersion"
+          Write-Host "VCToolsInstallDir: $env:VCToolsInstallDir"
+
+          if ([string]::IsNullOrWhiteSpace($env:VCToolsVersion)) {
+            throw 'VCToolsVersion rỗng sau vcvars64.'
+          }
+
+          if (!$env:VCToolsVersion.StartsWith("$env:MSVC_TOOLSET_VERSION.")) {
+            throw (
+              "vcvars64 không chọn MSVC $env:MSVC_TOOLSET_VERSION. " +
+              "Actual=$env:VCToolsVersion"
+            )
+          }
+
+          if (
+            [string]::IsNullOrWhiteSpace($env:VCToolsInstallDir) -or
+            !(Test-Path -LiteralPath $env:VCToolsInstallDir)
+          ) {
+            throw "VCToolsInstallDir không hợp lệ: $env:VCToolsInstallDir"
+          }
+
+          $yvals = Join-Path $env:VCToolsInstallDir 'include\yvals_core.h'
+          if (!(Test-Path -LiteralPath $yvals)) {
+            throw "Không tìm thấy MSVC STL yvals_core.h: $yvals"
+          }
+
+          Write-Host 'MSVC 14.38 environment: OK'
+
       # ============================================================
       # 3. RESTORE PINNED AKIRA COMPILER CACHE
       # ============================================================
 
       - name: Restore Akira LLVM17 compiler cache
         id: akira-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: C:\AkiraLLVM17
           key: akira-llvm17-win2022-${{ env.AKIRA_COMMIT }}-${{ env.AKIRA_CACHE_VERSION }}
@@ -460,6 +566,16 @@ jobs:
             Select-Object Name, Length |
             Format-Table
 
+      # Save NGAY sau khi build compiler thành công.
+      # Như vậy nếu project/pass test phía sau lỗi, lần chạy kế tiếp
+      # vẫn không phải build lại LLVM hơn 1 giờ.
+      - name: Save Akira LLVM17 compiler cache immediately
+        if: steps.akira-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\AkiraLLVM17
+          key: akira-llvm17-win2022-${{ env.AKIRA_COMMIT }}-${{ env.AKIRA_CACHE_VERSION }}
+
       # ============================================================
       # 5. VERIFY CACHED/BUILT AKIRA
       # ============================================================
@@ -494,6 +610,17 @@ jobs:
           & $clangcl --version
           if ($LASTEXITCODE -ne 0) {
             throw 'Akira clang-cl.exe không chạy được.'
+          }
+
+          Write-Host '=== MSVC compatibility toolset ==='
+          Write-Host "VCToolsVersion: $env:VCToolsVersion"
+          Write-Host "VCToolsInstallDir: $env:VCToolsInstallDir"
+
+          if (!$env:VCToolsVersion.StartsWith("$env:MSVC_TOOLSET_VERSION.")) {
+            throw (
+              "Akira Clang 17 đang bị ghép với sai MSVC STL. " +
+              "Expected=$env:MSVC_TOOLSET_VERSION.x Actual=$env:VCToolsVersion"
+            )
           }
 
           "AKIRA_CLANG=$clang" |
