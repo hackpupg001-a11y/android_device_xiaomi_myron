@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v10
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v11
 
 on:
   workflow_dispatch:
@@ -49,12 +49,14 @@ jobs:
       # - indirect globals
       # - C-string encryption
       # - control-flow flattening
+      # clang-cl-safe forwarding form. /clang:<arg> is passed to
+      # the underlying Clang driver instead of being parsed as a cl.exe option.
       AKIRA_FLAGS: >-
-        -mllvm -irobf-indbr
-        -mllvm -irobf-icall
-        -mllvm -irobf-indgv
-        -mllvm -irobf-cse
-        -mllvm -irobf-cff
+        /clang:-mllvm /clang:-irobf-indbr
+        /clang:-mllvm /clang:-irobf-icall
+        /clang:-mllvm /clang:-irobf-indgv
+        /clang:-mllvm /clang:-irobf-cse
+        /clang:-mllvm /clang:-irobf-cff
 
     steps:
       # ============================================================
@@ -767,6 +769,61 @@ jobs:
           "AKIRA_CLANGCL=$clangcl" |
             Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Verify clang-cl forwarding syntax
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $dir = Join-Path $env:RUNNER_TEMP 'clangcl-forwarding-test'
+
+          if (Test-Path -LiteralPath $dir) {
+            Remove-Item -LiteralPath $dir -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+          $srcFile = Join-Path $dir 'driver_probe.cpp'
+
+          @'
+          #include <cstdint>
+
+          static_assert(_MSC_VER == 1938, "Expected MSVC compatibility 19.38");
+
+          int main()
+          {
+              return 0;
+          }
+          '@ |
+            Out-File `
+              -LiteralPath $srcFile `
+              -Encoding ascii
+
+          Push-Location $dir
+
+          try {
+            & $env:AKIRA_CLANGCL `
+              /nologo `
+              /c `
+              /Fo:driver_probe.obj `
+              $srcFile `
+              /clang:-fms-compatibility-version=19.38
+
+            if ($LASTEXITCODE -ne 0) {
+              throw (
+                "clang-cl /clang: forwarding test thất bại: " +
+                "$LASTEXITCODE"
+              )
+            }
+
+            if (!(Test-Path -LiteralPath 'driver_probe.obj')) {
+              throw 'clang-cl forwarding test không tạo driver_probe.obj.'
+            }
+
+            Write-Host 'clang-cl /clang:-fms-compatibility-version=19.38: OK'
+          }
+          finally {
+            Pop-Location
+          }
+
       - name: Verify Akira obfuscation passes by compile and run
         run: |
           $ErrorActionPreference = 'Stop'
@@ -825,18 +882,20 @@ jobs:
           Push-Location $testDir
 
           try {
+            Write-Host 'Using clang-cl-safe /clang: forwarding for MSVC compatibility and Akira passes.'
+
             & $env:AKIRA_CLANGCL `
               /nologo `
               /O2 `
               /EHsc `
               /Fe:akira_test.exe `
               $testCpp `
-              -fms-compatibility-version=19.38 `
-              -mllvm -irobf-indbr `
-              -mllvm -irobf-icall `
-              -mllvm -irobf-indgv `
-              -mllvm -irobf-cse `
-              -mllvm -irobf-cff
+              /clang:-fms-compatibility-version=19.38 `
+              /clang:-mllvm /clang:-irobf-indbr `
+              /clang:-mllvm /clang:-irobf-icall `
+              /clang:-mllvm /clang:-irobf-indgv `
+              /clang:-mllvm /clang:-irobf-cse `
+              /clang:-mllvm /clang:-irobf-cff
 
             if ($LASTEXITCODE -ne 0) {
               throw "Akira pass compile test thất bại: $LASTEXITCODE"
@@ -1022,8 +1081,8 @@ jobs:
       # 8. CONFIGURE PROJECT WITH PINNED AKIRA clang-cl
       #
       # Dùng Ninja single-config để CMake không tự quay lại cl.exe.
-      # AKIRA_FLAGS được thêm vào base C/CXX flags; Release defaults
-      # của CMake vẫn được giữ nguyên.
+      # Compiler probes chỉ nhận /clang:-fms-compatibility-version=19.38.
+      # Akira passes được inject sau compiler detection.
       # ============================================================
 
       # ============================================================
@@ -1123,8 +1182,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             "-DCMAKE_C_COMPILER=$env:AKIRA_CLANGCL" `
             "-DCMAKE_CXX_COMPILER=$env:AKIRA_CLANGCL" `
-            "-DCMAKE_C_FLAGS=-fms-compatibility-version=19.38" `
-            "-DCMAKE_CXX_FLAGS=-fms-compatibility-version=19.38"
+            "-DCMAKE_C_FLAGS=/clang:-fms-compatibility-version=19.38" `
+            "-DCMAKE_CXX_FLAGS=/clang:-fms-compatibility-version=19.38"
 
           if ($LASTEXITCODE -ne 0) {
             throw (
@@ -1250,7 +1309,7 @@ jobs:
 
           # Keep all repeated -mllvm pairs together through CMake de-duplication.
           add_compile_options(
-            "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-mllvm -irobf-indbr -mllvm -irobf-icall -mllvm -irobf-indgv -mllvm -irobf-cse -mllvm -irobf-cff>"
+            "$<$<COMPILE_LANGUAGE:CXX>:SHELL:/clang:-mllvm /clang:-irobf-indbr /clang:-mllvm /clang:-irobf-icall /clang:-mllvm /clang:-irobf-indgv /clang:-mllvm /clang:-irobf-cse /clang:-mllvm /clang:-irobf-cff>"
           )
 
           message(STATUS "SpecialReloadClient Akira target flags injected AFTER compiler detection")
@@ -1269,8 +1328,8 @@ jobs:
             "-DCMAKE_BUILD_TYPE=${{ inputs.build_config }}" `
             "-DCMAKE_C_COMPILER=$env:AKIRA_CLANGCL" `
             "-DCMAKE_CXX_COMPILER=$env:AKIRA_CLANGCL" `
-            "-DCMAKE_C_FLAGS=-fms-compatibility-version=19.38" `
-            "-DCMAKE_CXX_FLAGS=-fms-compatibility-version=19.38" `
+            "-DCMAKE_C_FLAGS=/clang:-fms-compatibility-version=19.38" `
+            "-DCMAKE_CXX_FLAGS=/clang:-fms-compatibility-version=19.38" `
             "-DCMAKE_PROJECT_INCLUDE=$inject" `
             -DBUILD_TESTING=ON
 
