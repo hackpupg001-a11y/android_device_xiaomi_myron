@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 + MSVC 14.38
+name: Build SpecialReloadClient - Akira LLVM17 + VS2022 17.8 Build Tools
 
 on:
   workflow_dispatch:
@@ -33,14 +33,15 @@ jobs:
       AKIRA_COMMIT: 112e63dadff9d1b81a65b24b1a16a03f56d63a0f
       AKIRA_INSTALL: C:\AkiraLLVM17
 
-      # Akira này là LLVM/Clang 17. MSVC STL mới trên windows-2022
-      # hiện yêu cầu Clang mới hơn, vì vậy pin STL/toolset VS 17.8
-      # (MSVC 14.38), là dòng tương thích với Clang 17.
+      # Akira này là LLVM/Clang 17. Dùng Build Tools 17.8 riêng để có
+      # MSVC 14.38 STL tương thích, thay vì modify VS Enterprise mới
+      # đang có sẵn trên GitHub runner.
+      VS178_INSTALL: C:\VS2022BT178
+      VS178_BOOTSTRAPPER_URL: https://download.visualstudio.microsoft.com/download/pr/ac0cb103-349c-4207-8b60-334952278a84/217310512fc5113ad70547200f13d42b94a4476be5ef77cfd54aba74f82c59aa/vs_BuildTools.exe
       MSVC_TOOLSET_VERSION: "14.38"
-      MSVC_TOOLSET_COMPONENT: Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64
 
       # Đổi số này khi muốn ép GitHub Actions rebuild cache compiler.
-      AKIRA_CACHE_VERSION: v3
+      AKIRA_CACHE_VERSION: v4
 
       # Các pass Akira đang hỗ trợ:
       # - indirect branches
@@ -91,119 +92,98 @@ jobs:
       # 2. VISUAL STUDIO / WINDOWS SDK ENVIRONMENT
       # ============================================================
 
-      - name: Locate Visual Studio 2022
+      - name: Install pinned VS2022 Build Tools 17.8
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $vswhere = Join-Path `
-            ${env:ProgramFiles(x86)} `
-            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $bootstrapper = Join-Path `
+            $env:RUNNER_TEMP `
+            'vs_BuildTools_17_8.exe'
 
-          if (!(Test-Path -LiteralPath $vswhere)) {
-            throw 'Không tìm thấy vswhere.exe.'
+          Write-Host 'Downloading fixed Visual Studio 2022 Build Tools 17.8 bootstrapper...'
+
+          Invoke-WebRequest `
+            -Uri $env:VS178_BOOTSTRAPPER_URL `
+            -OutFile $bootstrapper `
+            -UseBasicParsing
+
+          if (!(Test-Path -LiteralPath $bootstrapper)) {
+            throw 'Không tải được VS2022 17.8 Build Tools bootstrapper.'
           }
 
-          $vsPath = & $vswhere `
-            -latest `
-            -products '*' `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath
+          $size = (Get-Item -LiteralPath $bootstrapper).Length
+          if ($size -lt 500000) {
+            throw "Bootstrapper quá nhỏ/bất thường: $size bytes."
+          }
 
-          if ([string]::IsNullOrWhiteSpace($vsPath)) {
-            throw 'Không tìm thấy Visual Studio 2022 C++ toolchain.'
+          # Verify Authenticode trước khi chạy bootstrapper tải từ mạng.
+          $sig = Get-AuthenticodeSignature -LiteralPath $bootstrapper
+
+          if ($sig.Status -ne 'Valid') {
+            throw "Bootstrapper Authenticode không hợp lệ: $($sig.Status)"
+          }
+
+          if (
+            $null -eq $sig.SignerCertificate -or
+            $sig.SignerCertificate.Subject -notmatch '(?i)Microsoft'
+          ) {
+            throw 'Bootstrapper không được ký bởi Microsoft.'
+          }
+
+          Write-Host "Bootstrapper signer: $($sig.SignerCertificate.Subject)"
+
+          if (Test-Path -LiteralPath $env:VS178_INSTALL) {
+            Remove-Item `
+              -LiteralPath $env:VS178_INSTALL `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+          # Cài instance Build Tools 17.8 riêng.
+          # Chỉ cần VC x86/x64; Windows SDK đã có sẵn trên windows-2022.
+          $args = @(
+            '--quiet',
+            '--wait',
+            '--norestart',
+            '--nocache',
+            '--installPath', $env:VS178_INSTALL,
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
+          )
+
+          $proc = Start-Process `
+            -FilePath $bootstrapper `
+            -ArgumentList $args `
+            -Wait `
+            -PassThru `
+            -NoNewWindow
+
+          if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+            throw "VS2022 Build Tools 17.8 install thất bại. Exit code: $($proc.ExitCode)"
           }
 
           $vcvars = Join-Path `
-            $vsPath `
+            $env:VS178_INSTALL `
             'VC\Auxiliary\Build\vcvars64.bat'
 
           if (!(Test-Path -LiteralPath $vcvars)) {
-            throw 'Không tìm thấy vcvars64.bat.'
+            throw "Cài xong nhưng không thấy vcvars64.bat: $vcvars"
           }
-
-          "VS_PATH=$vsPath" |
-            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
           "VCVARS64=$vcvars" |
             Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
-          Write-Host "Visual Studio: $vsPath"
+          Write-Host "VS2022 Build Tools 17.8 installed: $env:VS178_INSTALL"
 
-      - name: Ensure MSVC 14.38 toolset for Clang 17
+      - name: Initialize VS2022 17.8 x64 environment
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $msvcRoot = Join-Path $env:VS_PATH 'VC\Tools\MSVC'
+          $envFile = Join-Path `
+            $env:RUNNER_TEMP `
+            'vs178_env.txt'
 
-          $toolset = Get-ChildItem `
-            -LiteralPath $msvcRoot `
-            -Directory `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.Name -like "$env:MSVC_TOOLSET_VERSION.*"
-            } |
-            Sort-Object Name -Descending |
-            Select-Object -First 1
-
-          if ($null -eq $toolset) {
-            Write-Host "MSVC $env:MSVC_TOOLSET_VERSION chưa có; cài component tương thích Clang 17..."
-
-            $setup = Join-Path `
-              ${env:ProgramFiles(x86)} `
-              'Microsoft Visual Studio\Installer\setup.exe'
-
-            if (!(Test-Path -LiteralPath $setup)) {
-              throw 'Không tìm thấy Visual Studio Installer setup.exe.'
-            }
-
-            $args = @(
-              'modify',
-              '--installPath', $env:VS_PATH,
-              '--add', $env:MSVC_TOOLSET_COMPONENT,
-              '--quiet',
-              '--norestart'
-            )
-
-            $proc = Start-Process `
-              -FilePath $setup `
-              -ArgumentList $args `
-              -Wait `
-              -PassThru `
-              -NoNewWindow
-
-            # VS Installer thường dùng 0 = success, 3010 = success/reboot required.
-            if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
-              throw "Cài MSVC 14.38 thất bại. Exit code: $($proc.ExitCode)"
-            }
-
-            $toolset = Get-ChildItem `
-              -LiteralPath $msvcRoot `
-              -Directory `
-              -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.Name -like "$env:MSVC_TOOLSET_VERSION.*"
-              } |
-              Sort-Object Name -Descending |
-              Select-Object -First 1
-          }
-
-          if ($null -eq $toolset) {
-            throw 'Đã chạy installer nhưng vẫn không tìm thấy MSVC 14.38.'
-          }
-
-          "MSVC_TOOLSET_FULL_VERSION=$($toolset.Name)" |
-            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-
-          Write-Host "MSVC toolset selected: $($toolset.Name)"
-
-      - name: Initialize VS2022 x64 environment with MSVC 14.38
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $envFile = Join-Path $env:RUNNER_TEMP 'vs2022_1438_env.txt'
-
-          # vcvars64.bat nhận -vcvars_ver để chọn toolset side-by-side.
-          cmd.exe /d /s /c "`"$env:VCVARS64`" -vcvars_ver=$env:MSVC_TOOLSET_VERSION >nul && set" |
+          cmd.exe /d /s /c "`"$env:VCVARS64`" >nul && set" |
             Out-File `
               -LiteralPath $envFile `
               -Encoding ascii
@@ -214,6 +194,7 @@ jobs:
             }
 
             $parts = $line -split '=', 2
+
             if ($parts.Count -ne 2) {
               continue
             }
@@ -232,22 +213,26 @@ jobs:
                 -Append
           }
 
-          Remove-Item -LiteralPath $envFile -Force
+          Remove-Item `
+            -LiteralPath $envFile `
+            -Force
 
-      - name: Verify MSVC 14.38 environment
+      - name: Verify VS2022 17.8 MSVC 14.38 environment
         run: |
           $ErrorActionPreference = 'Stop'
 
-          Write-Host "VCToolsVersion: $env:VCToolsVersion"
+          Write-Host "VCToolsVersion   : $env:VCToolsVersion"
           Write-Host "VCToolsInstallDir: $env:VCToolsInstallDir"
+          Write-Host "WindowsSdkDir    : $env:WindowsSdkDir"
+          Write-Host "WindowsSDKVersion: $env:WindowsSDKVersion"
 
           if ([string]::IsNullOrWhiteSpace($env:VCToolsVersion)) {
-            throw 'VCToolsVersion rỗng sau vcvars64.'
+            throw 'VCToolsVersion rỗng.'
           }
 
           if (!$env:VCToolsVersion.StartsWith("$env:MSVC_TOOLSET_VERSION.")) {
             throw (
-              "vcvars64 không chọn MSVC $env:MSVC_TOOLSET_VERSION. " +
+              "Sai MSVC toolset. Expected=$env:MSVC_TOOLSET_VERSION.x " +
               "Actual=$env:VCToolsVersion"
             )
           }
@@ -259,10 +244,26 @@ jobs:
             throw "VCToolsInstallDir không hợp lệ: $env:VCToolsInstallDir"
           }
 
-          $yvals = Join-Path $env:VCToolsInstallDir 'include\yvals_core.h'
-          if (!(Test-Path -LiteralPath $yvals)) {
-            throw "Không tìm thấy MSVC STL yvals_core.h: $yvals"
+          $cl = Join-Path `
+            $env:VCToolsInstallDir `
+            'bin\Hostx64\x64\cl.exe'
+
+          $link = Join-Path `
+            $env:VCToolsInstallDir `
+            'bin\Hostx64\x64\link.exe'
+
+          $yvals = Join-Path `
+            $env:VCToolsInstallDir `
+            'include\yvals_core.h'
+
+          foreach ($required in @($cl, $link, $yvals)) {
+            if (!(Test-Path -LiteralPath $required)) {
+              throw "MSVC 14.38 install thiếu: $required"
+            }
           }
+
+          Write-Host '=== cl.exe ==='
+          & $cl 2>&1 | Select-Object -First 5
 
           Write-Host 'MSVC 14.38 environment: OK'
 
@@ -1079,24 +1080,15 @@ jobs:
           # Locate dumpbin from VS2022
           # --------------------------------------------------------
 
-          $msvcRoot = Join-Path `
-            $env:VS_PATH `
-            'VC\Tools\MSVC'
+          $dumpbinPath = Join-Path `
+            $env:VCToolsInstallDir `
+            'bin\Hostx64\x64\dumpbin.exe'
 
-          $dumpbin = Get-ChildItem `
-            -LiteralPath $msvcRoot `
-            -Filter 'dumpbin.exe' `
-            -File `
-            -Recurse |
-            Where-Object {
-              $_.FullName -match '[\\/]bin[\\/]Hostx64[\\/]x64[\\/]dumpbin\.exe$'
-            } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-
-          if ($null -eq $dumpbin) {
-            throw 'Không tìm thấy x64 dumpbin.exe.'
+          if (!(Test-Path -LiteralPath $dumpbinPath)) {
+            throw "Không tìm thấy x64 dumpbin.exe: $dumpbinPath"
           }
+
+          $dumpbin = Get-Item -LiteralPath $dumpbinPath
 
           $headers = & $dumpbin.FullName `
             /headers `
