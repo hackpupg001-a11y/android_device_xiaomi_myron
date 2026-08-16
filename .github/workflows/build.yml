@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v14
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v15
 
 on:
   workflow_dispatch:
@@ -1279,6 +1279,137 @@ jobs:
       # Akira passes được inject sau compiler detection.
       # ============================================================
 
+      - name: Sanitize MSVC-only flags for clang-cl
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # The project was written with an MSVC branch. clang-cl intentionally
+          # defines MSVC-compatible CMake variables, so MSVC-only switches can
+          # accidentally be added even though Clang does not implement them.
+          #
+          # Keep /WX. Remove only switches proven invalid/unused in this build:
+          #   /Zc:preprocessor  -> Clang already uses its own preprocessor
+          #   /GL               -> MSVC whole-program optimization
+          #   /LTCG[:...]       -> MSVC linker-side LTCG counterpart
+          #
+          # Akira obfuscation remains enabled independently.
+
+          $project = $env:PROJECT_DIR
+
+          $cmakeFiles = @(
+            Get-ChildItem `
+              -LiteralPath $project `
+              -File `
+              -Recurse |
+            Where-Object {
+              (
+                $_.Name -eq 'CMakeLists.txt' -or
+                $_.Extension -ieq '.cmake'
+              ) -and
+              $_.Name -notlike '*.workflow-*'
+            }
+          )
+
+          if ($cmakeFiles.Count -eq 0) {
+            throw 'Không tìm thấy CMakeLists.txt/.cmake để sanitize.'
+          }
+
+          $changed = @()
+
+          foreach ($file in $cmakeFiles) {
+            $original = Get-Content -LiteralPath $file.FullName -Raw
+            $updated = $original
+
+            # Case-insensitive, token-aware removal.
+            $updated = [regex]::Replace(
+              $updated,
+              '(?i)(?<![A-Za-z0-9_])/Zc:preprocessor(?![A-Za-z0-9_])',
+              ''
+            )
+
+            $updated = [regex]::Replace(
+              $updated,
+              '(?i)(?<![A-Za-z0-9_])/GL(?![A-Za-z0-9_:])',
+              ''
+            )
+
+            $updated = [regex]::Replace(
+              $updated,
+              '(?i)(?<![A-Za-z0-9_])/LTCG(?::[A-Za-z0-9_-]+)?(?![A-Za-z0-9_])',
+              ''
+            )
+
+            if ($updated -ne $original) {
+              $relative = [IO.Path]::GetRelativePath(
+                $project,
+                $file.FullName
+              )
+
+              $backupRoot = Join-Path `
+                $env:RUNNER_TEMP `
+                'cmake-msvc-flag-backup'
+
+              $backup = Join-Path $backupRoot $relative
+              $backupDir = Split-Path -Parent $backup
+
+              New-Item `
+                -ItemType Directory `
+                -Path $backupDir `
+                -Force |
+                Out-Null
+
+              Copy-Item `
+                -LiteralPath $file.FullName `
+                -Destination $backup `
+                -Force
+
+              Set-Content `
+                -LiteralPath $file.FullName `
+                -Value $updated `
+                -Encoding utf8
+
+              $changed += $relative
+            }
+          }
+
+          Write-Host '=== CMake files sanitized for clang-cl ==='
+
+          if ($changed.Count -eq 0) {
+            Write-Host 'No literal MSVC-only flags required patching.'
+          }
+          else {
+            $changed |
+              Sort-Object -Unique |
+              ForEach-Object {
+                Write-Host ("  {0}" -f $_)
+              }
+          }
+
+          # Fail here if any active CMake input still contains the known
+          # incompatible switches. This avoids waiting for compilation.
+          $remaining = @()
+
+          foreach ($file in $cmakeFiles) {
+            $current = Get-Content -LiteralPath $file.FullName -Raw
+
+            if (
+              $current -match '(?i)/Zc:preprocessor' -or
+              $current -match '(?i)(?<![A-Za-z0-9_])/GL(?![A-Za-z0-9_:])' -or
+              $current -match '(?i)/LTCG(?::[A-Za-z0-9_-]+)?'
+            ) {
+              $remaining += $file.FullName
+            }
+          }
+
+          if ($remaining.Count -gt 0) {
+            throw (
+              'Vẫn còn MSVC-only flags trong CMake input: ' +
+              (($remaining | Sort-Object -Unique) -join ', ')
+            )
+          }
+
+          Write-Host 'MSVC-only clang-cl flag sanitation: OK'
+
       # ============================================================
       # 8A. CMAKE/CLANG-CL ABI PREFLIGHT — NO OBFUSCATION
       # ============================================================
@@ -1377,7 +1508,9 @@ jobs:
             "-DCMAKE_C_COMPILER=$env:AKIRA_CLANGCL" `
             "-DCMAKE_CXX_COMPILER=$env:AKIRA_CLANGCL" `
             "-DCMAKE_C_FLAGS=/clang:-fms-compatibility-version=19.38" `
-            "-DCMAKE_CXX_FLAGS=/clang:-fms-compatibility-version=19.38"
+            "-DCMAKE_CXX_FLAGS=/clang:-fms-compatibility-version=19.38" `
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF `
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=OFF
 
           if ($LASTEXITCODE -ne 0) {
             throw (
@@ -1524,6 +1657,8 @@ jobs:
             "-DCMAKE_CXX_COMPILER=$env:AKIRA_CLANGCL" `
             "-DCMAKE_C_FLAGS=/clang:-fms-compatibility-version=19.38" `
             "-DCMAKE_CXX_FLAGS=/clang:-fms-compatibility-version=19.38" `
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF `
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=OFF `
             "-DCMAKE_PROJECT_INCLUDE=$inject" `
             -DBUILD_TESTING=ON
 
@@ -1640,6 +1775,29 @@ jobs:
               throw "build.ninja thiếu Akira target flag: $flag"
             }
           }
+
+          # Known MSVC-only switches must not reach clang-cl.
+          $badBuildFlags = @(
+            '/Zc:preprocessor',
+            '/GL',
+            '/LTCG'
+          )
+
+          foreach ($badFlag in $badBuildFlags) {
+            if (
+              $ninjaText.IndexOf(
+                $badFlag,
+                [System.StringComparison]::OrdinalIgnoreCase
+              ) -ge 0
+            ) {
+              throw (
+                "build.ninja vẫn chứa MSVC-only flag không hợp với clang-cl: " +
+                $badFlag
+              )
+            }
+          }
+
+          Write-Host 'Known MSVC-only clang-cl flags in build.ninja: NONE'
 
           # CMake's own detection/try_compile commands must not be obfuscated.
           $configureLog = Get-ChildItem `
