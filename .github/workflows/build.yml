@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 + VS2022 17.8 Build Tools
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED
 
 on:
   workflow_dispatch:
@@ -41,7 +41,7 @@ jobs:
       MSVC_TOOLSET_VERSION: "14.38"
 
       # Đổi số này khi muốn ép GitHub Actions rebuild cache compiler.
-      AKIRA_CACHE_VERSION: v4
+      AKIRA_CACHE_VERSION: v6
 
       # Các pass Akira đang hỗ trợ:
       # - indirect branches
@@ -50,7 +50,6 @@ jobs:
       # - C-string encryption
       # - control-flow flattening
       AKIRA_FLAGS: >-
-        -mllvm -irobf
         -mllvm -irobf-indbr
         -mllvm -irobf-icall
         -mllvm -irobf-indgv
@@ -410,15 +409,106 @@ jobs:
             -DLLVM_ENABLE_ASSERTIONS=OFF `
             -DLLVM_ENABLE_PROJECTS="clang" `
             -DLLVM_TARGETS_TO_BUILD="X86" `
+            -DLLVM_ENABLE_DIA_SDK=OFF `
             -DLLVM_INCLUDE_TESTS=OFF `
             -DLLVM_INCLUDE_EXAMPLES=OFF `
             -DLLVM_INCLUDE_BENCHMARKS=OFF `
             -DLLVM_BUILD_TESTS=OFF `
-            -DLLVM_ENABLE_TERMINFO=OFF
+            -DLLVM_ENABLE_TERMINFO=OFF `
+            -DLLVM_ENABLE_LIBXML2=OFF `
+            -DLLVM_ENABLE_ZLIB=OFF `
+            -DLLVM_ENABLE_ZSTD=OFF
 
           if ($LASTEXITCODE -ne 0) {
             throw "Configure Akira LLVM17 thất bại: $LASTEXITCODE"
           }
+
+          $cache = Join-Path $build 'CMakeCache.txt'
+
+          if (!(Test-Path -LiteralPath $cache)) {
+            throw 'Akira CMakeCache.txt không tồn tại.'
+          }
+
+          $cacheText = Get-Content -LiteralPath $cache -Raw
+
+          if ($cacheText -notmatch '(?m)^LLVM_ENABLE_DIA_SDK:BOOL=OFF$') {
+            throw 'LLVM_ENABLE_DIA_SDK không phải OFF — dừng để tránh kéo DIA/ATL.'
+          }
+
+          $compilerMatch = [regex]::Match(
+            $cacheText,
+            '(?m)^CMAKE_CXX_COMPILER(?::[^=]+)?=(.+)$'
+          )
+
+          if (!$compilerMatch.Success) {
+            throw 'Không đọc được CMAKE_CXX_COMPILER của Akira build.'
+          }
+
+          $akiraHostCompiler = $compilerMatch.Groups[1].Value.Trim().Replace('/', '\')
+
+          if (
+            $akiraHostCompiler -notlike "$env:VS178_INSTALL\VC\Tools\MSVC\14.38.*\bin\Hostx64\x64\cl.exe"
+          ) {
+            throw (
+              "Akira host compiler không phải MSVC 14.38 từ VS17.8. " +
+              "Actual=$akiraHostCompiler"
+            )
+          }
+
+          $ninjaFile = Join-Path $build 'build.ninja'
+
+          if (!(Test-Path -LiteralPath $ninjaFile)) {
+            throw 'Akira build.ninja không tồn tại.'
+          }
+
+          $diaLeak = Select-String `
+            -LiteralPath $ninjaFile `
+            -Pattern 'DIA SDK[\\/]include|DebugInfo[\\/]PDB[\\/]DIA[\\/].*\.cpp' `
+            -ErrorAction SilentlyContinue
+
+          if ($diaLeak) {
+            throw (
+              "DIA vẫn lọt vào build graph dù LLVM_ENABLE_DIA_SDK=OFF. " +
+              "Ví dụ: $($diaLeak[0].Line)"
+            )
+          }
+
+          Write-Host "Akira host compiler: $akiraHostCompiler"
+          Write-Host 'LLVM DIA SDK: OFF'
+          Write-Host 'DIA sources/include paths in build.ninja: NONE'
+
+      - name: Preflight Akira critical LLVM targets
+        if: steps.akira-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $build = Join-Path $env:GITHUB_WORKSPACE 'akira-build'
+
+          $jobs = [Math]::Min(
+            [Environment]::ProcessorCount,
+            4
+          )
+
+          if ($jobs -lt 1) {
+            $jobs = 1
+          }
+
+          Write-Host "Preflight with $jobs jobs..."
+
+          cmake `
+            --build $build `
+            --target LLVMDebugInfoPDB LLVMObfuscation `
+            --parallel $jobs
+
+          if ($LASTEXITCODE -ne 0) {
+            throw (
+              "Akira critical-target preflight thất bại: $LASTEXITCODE. " +
+              "Dừng trước khi build full clang."
+            )
+          }
+
+          Write-Host 'LLVMDebugInfoPDB preflight: OK'
+          Write-Host 'LLVMObfuscation preflight: OK'
 
       - name: Build Akira LLVM17 clang
         if: steps.akira-cache.outputs.cache-hit != 'true'
@@ -428,10 +518,23 @@ jobs:
           $build = Join-Path $env:GITHUB_WORKSPACE 'akira-build'
 
           # clang-cl KHÔNG phải Ninja target riêng.
+          # Tự lấy số CPU runner nhưng cap ở 4 để không làm runner Windows
+          # thiếu RAM khi compile LLVM.
+          $jobs = [Math]::Min(
+            [Environment]::ProcessorCount,
+            4
+          )
+
+          if ($jobs -lt 1) {
+            $jobs = 1
+          }
+
+          Write-Host "Building Akira clang with $jobs parallel jobs..."
+
           cmake `
             --build $build `
             --target clang `
-            --parallel 2
+            --parallel $jobs
 
           if ($LASTEXITCODE -ne 0) {
             throw "Build Akira LLVM17 clang thất bại: $LASTEXITCODE"
@@ -649,7 +752,10 @@ jobs:
           $testCpp = Join-Path $testDir 'test.cpp'
 
           @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
           #include <cstdint>
+          #include <string>
 
           volatile std::int32_t g_value = 123;
           volatile std::int32_t g_sink = 0;
@@ -658,12 +764,16 @@ jobs:
           std::int32_t test_function(std::int32_t x)
           {
               const char* text = "AKIRA_PASS_RUNTIME_TEST";
+              std::string s = "MSVC_STL_OK";
 
               if (x > 50)
                   return g_value + static_cast<unsigned char>(text[0]);
 
               if ((x & 1) != 0)
                   return x * 5;
+
+              if (GetCurrentProcessId() == 0 || s.empty())
+                  return 9;
 
               return x * 7;
           }
@@ -687,7 +797,6 @@ jobs:
               /EHsc `
               /Fe:akira_test.exe `
               $testCpp `
-              -mllvm -irobf `
               -mllvm -irobf-indbr `
               -mllvm -irobf-icall `
               -mllvm -irobf-indgv `
@@ -1399,7 +1508,7 @@ jobs:
 
           Platform: Windows x64
           Build configuration: ${{ inputs.build_config }}
-          Compiler: Akira LLVM17 / clang-cl
+          Compiler: Akira LLVM17 / clang-cl (MSVC 14.38, DIA SDK disabled)
           Akira commit: $env:AKIRA_COMMIT
           Authenticode signed: $signedState
 
