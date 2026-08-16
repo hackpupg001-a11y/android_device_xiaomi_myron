@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v13
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v14
 
 on:
   workflow_dispatch:
@@ -1128,7 +1128,7 @@ jobs:
           }
 
           if (!(Test-Path -LiteralPath $mainCpp)) {
-            throw "Thiếu $mainName: $mainCpp"
+            throw "Thiếu ${mainName}: $mainCpp"
           }
 
           $cmakeText = Get-Content -LiteralPath $cmake -Raw
