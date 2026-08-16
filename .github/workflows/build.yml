@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v7
+name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v9
 
 on:
   workflow_dispatch:
@@ -1078,6 +1078,8 @@ jobs:
             "-DCMAKE_CXX_COMPILER=$env:AKIRA_CLANGCL" `
             "-DCMAKE_C_FLAGS=$flags" `
             "-DCMAKE_CXX_FLAGS=$flags" `
+            "-DCMAKE_C_SIMULATE_VERSION=19.38" `
+            "-DCMAKE_CXX_SIMULATE_VERSION=19.38" `
             -DBUILD_TESTING=ON
 
           if ($LASTEXITCODE -ne 0) {
