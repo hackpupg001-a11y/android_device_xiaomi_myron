@@ -1,14 +1,15 @@
-name: Build SpecialReloadClient (C++) from Google Drive
+name: Build SpecialReloadClient - Akira LLVM17 Hardened
 
 on:
   workflow_dispatch:
     inputs:
       drive_url:
-        description: "Google Drive file ID hoặc link chia sẻ ZIP source SpecialReloadClient (C++)"
+        description: "Google Drive file ID hoặc link chia sẻ ZIP source SpecialReloadClient"
         required: true
         type: string
+
       build_config:
-        description: "Cấu hình build"
+        description: "Build configuration"
         required: true
         default: "Release"
         type: choice
@@ -20,222 +21,737 @@ permissions:
 
 jobs:
   build-windows:
-    # Cố định VS 2022 (MSVC toolset đi kèm sẵn), tránh windows-latest đổi image
-    # ngầm làm lệch toolchain giữa các lần build.
     runs-on: windows-2022
-    timeout-minutes: 90
+
+    # LLVM build lần đầu khá nặng.
+    timeout-minutes: 240
 
     defaults:
       run:
         shell: pwsh
 
+    env:
+      AKIRA_REPO: https://github.com/thomasxm/Akira-obfuscator.git
+
+      # Cache version:
+      # đổi số này nếu muốn ép rebuild toàn bộ Akira.
+      AKIRA_CACHE_VERSION: v1
+
+      # Obfuscation Akira.
+      #
+      # irobf-indbr = indirect branches
+      # irobf-icall = indirect calls
+      # irobf-indgv = indirect globals
+      # irobf-cse   = C string encryption
+      # irobf-cff   = control-flow flattening
+      #
+      # -irobf bật framework Akira.
+      AKIRA_FLAGS: >-
+        -mllvm -irobf
+        -mllvm -irobf-indbr
+        -mllvm -irobf-icall
+        -mllvm -irobf-indgv
+        -mllvm -irobf-cse
+        -mllvm -irobf-cff
+
     steps:
-      - name: Install download tool
+
+      # ============================================================
+      # 1. TOOLS
+      # ============================================================
+
+      - name: Show runner information
         run: |
           $ErrorActionPreference = 'Stop'
+
+          Write-Host "OS:"
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+
+          Write-Host ""
+          Write-Host "CMake:"
+          cmake --version
+
+          Write-Host ""
+          Write-Host "Ninja:"
+          ninja --version
+
+          Write-Host ""
+          Write-Host "Git:"
+          git --version
+
+          Write-Host ""
+          Write-Host "Python:"
+          python --version
+
+      - name: Install gdown
+        run: |
+          $ErrorActionPreference = 'Stop'
+
           python -m pip install --upgrade pip
           python -m pip install "gdown>=5.2,<6"
+
+      # ============================================================
+      # 2. LOCATE VISUAL STUDIO
+      # ============================================================
+
+      - name: Locate Visual Studio 2022
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $vswhere = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+
+          if (!(Test-Path -LiteralPath $vswhere)) {
+            throw "vswhere.exe không tồn tại."
+          }
+
+          $vsPath = & $vswhere `
+            -latest `
+            -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if ([string]::IsNullOrWhiteSpace($vsPath)) {
+            throw "Không tìm thấy Visual Studio 2022 C++ toolchain."
+          }
+
+          $vcvars = Join-Path `
+            $vsPath `
+            'VC\Auxiliary\Build\vcvars64.bat'
+
+          if (!(Test-Path -LiteralPath $vcvars)) {
+            throw "Không tìm thấy vcvars64.bat."
+          }
+
+          "VS_PATH=$vsPath" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "VCVARS64=$vcvars" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Visual Studio:"
+          Write-Host $vsPath
+
+      # ============================================================
+      # 3. IMPORT VS x64 ENVIRONMENT
+      # ============================================================
+
+      - name: Initialize VS2022 x64 environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tempFile = Join-Path `
+            $env:RUNNER_TEMP `
+            'vs_env.txt'
+
+          cmd.exe /c "`"$env:VCVARS64`" >nul && set" |
+            Out-File `
+              -LiteralPath $tempFile `
+              -Encoding ascii
+
+          foreach ($line in Get-Content -LiteralPath $tempFile) {
+
+            if ($line -notmatch '=') {
+              continue
+            }
+
+            $parts = $line -split '=', 2
+
+            if ($parts.Count -ne 2) {
+              continue
+            }
+
+            $name  = $parts[0]
+            $value = $parts[1]
+
+            if ([string]::IsNullOrWhiteSpace($name)) {
+              continue
+            }
+
+            # GITHUB_ENV format.
+            "$name=$value" |
+              Out-File `
+                $env:GITHUB_ENV `
+                -Encoding utf8 `
+                -Append
+          }
+
+          Remove-Item `
+            -LiteralPath $tempFile `
+            -Force
+
+      # ============================================================
+      # 4. AKIRA COMPILER CACHE
+      # ============================================================
+
+      - name: Restore Akira LLVM17 cache
+        id: akira-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\AkiraLLVM17
+          key: akira-llvm17-windows2022-${{ env.AKIRA_CACHE_VERSION }}
+
+      # ============================================================
+      # 5. BUILD AKIRA IF CACHE MISSES
+      # ============================================================
+
+      - name: Clone Akira LLVM17
+        if: steps.akira-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $src = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'akira-src'
+
+          if (Test-Path -LiteralPath $src) {
+            Remove-Item `
+              -LiteralPath $src `
+              -Recurse `
+              -Force
+          }
+
+          git clone `
+            --depth 1 `
+            $env:AKIRA_REPO `
+            $src
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Clone Akira thất bại."
+          }
+
+          Set-Location -LiteralPath $src
+
+          $commit = git rev-parse HEAD
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Không lấy được Akira commit."
+          }
+
+          "AKIRA_COMMIT=$commit" |
+            Out-File `
+              $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "Akira commit: $commit"
+
+      - name: Patch Akira Windows compile issue if required
+        if: steps.akira-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $crypto = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'akira-src\llvm\lib\Transforms\Obfuscation\CryptoUtils.cpp'
+
+          if (Test-Path -LiteralPath $crypto) {
+
+            $text = Get-Content `
+              -LiteralPath $crypto `
+              -Raw
+
+            if (
+              $text -match 'std::ifstream' -and
+              $text -notmatch '#include\s*<fstream>'
+            ) {
+              Write-Host "Adding missing <fstream> include..."
+
+              $text = "#include <fstream>`r`n" + $text
+
+              Set-Content `
+                -LiteralPath $crypto `
+                -Value $text `
+                -Encoding utf8
+            }
+          }
+
+      - name: Configure Akira LLVM17
+        if: steps.akira-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $src = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'akira-src'
+
+          $build = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'akira-build'
+
+          if (Test-Path -LiteralPath $build) {
+            Remove-Item `
+              -LiteralPath $build `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $build `
+            -Force |
+            Out-Null
+
+          cmake `
+            -S (Join-Path $src 'llvm') `
+            -B $build `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_FLAGS="/utf-8" `
+            -DLLVM_ENABLE_ASSERTIONS=OFF `
+            -DLLVM_ENABLE_PROJECTS="clang;lld" `
+            -DLLVM_TARGETS_TO_BUILD="X86" `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DLLVM_INCLUDE_BENCHMARKS=OFF `
+            -DLLVM_BUILD_TESTS=OFF `
+            -DLLVM_ENABLE_TERMINFO=OFF
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Configure Akira LLVM17 thất bại."
+          }
+
+      - name: Build Akira LLVM17
+        if: steps.akira-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $build = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'akira-build'
+
+          # Chỉ build compiler/linker cần thiết,
+          # không build toàn bộ LLVM + LLDB.
+          cmake `
+            --build $build `
+            --target clang clang-cl lld lld-link `
+            --parallel 2
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build Akira LLVM17 thất bại."
+          }
+
+      - name: Install Akira compiler
+        if: steps.akira-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $build = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'akira-build'
+
+          $dest = 'C:\AkiraLLVM17'
+
+          if (Test-Path -LiteralPath $dest) {
+            Remove-Item `
+              -LiteralPath $dest `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path (Join-Path $dest 'bin') `
+            -Force |
+            Out-Null
+
+          $required = @(
+            'clang.exe',
+            'clang-cl.exe',
+            'lld.exe',
+            'lld-link.exe'
+          )
+
+          foreach ($file in $required) {
+
+            $src = Join-Path `
+              $build `
+              "bin\$file"
+
+            if (!(Test-Path -LiteralPath $src)) {
+              throw "Compiler Akira thiếu $file"
+            }
+
+            Copy-Item `
+              -LiteralPath $src `
+              -Destination (Join-Path $dest 'bin') `
+              -Force
+          }
+
+          # Copy DLL runtime/compiler DLL dependencies.
+          Get-ChildItem `
+            -LiteralPath (Join-Path $build 'bin') `
+            -Filter '*.dll' `
+            -File `
+            -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              Copy-Item `
+                -LiteralPath $_.FullName `
+                -Destination (Join-Path $dest 'bin') `
+                -Force
+            }
+
+          $commit = $env:AKIRA_COMMIT
+
+          if ([string]::IsNullOrWhiteSpace($commit)) {
+            $commit = 'unknown'
+          }
+
+          $commit |
+            Out-File `
+              (Join-Path $dest 'AKIRA_COMMIT.txt') `
+              -Encoding ascii
+
+      # ============================================================
+      # 6. VERIFY AKIRA COMPILER
+      # ============================================================
+
+      - name: Verify Akira compiler
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $clang = 'C:\AkiraLLVM17\bin\clang.exe'
+          $clangcl = 'C:\AkiraLLVM17\bin\clang-cl.exe'
+
+          if (!(Test-Path -LiteralPath $clang)) {
+            throw "Akira clang.exe không tồn tại."
+          }
+
+          if (!(Test-Path -LiteralPath $clangcl)) {
+            throw "Akira clang-cl.exe không tồn tại."
+          }
+
+          & $clangcl --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Akira clang-cl không chạy được."
+          }
+
+          "AKIRA_CLANG=$clang" |
+            Out-File `
+              $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "AKIRA_CLANGCL=$clangcl" |
+            Out-File `
+              $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+      # ============================================================
+      # 7. TEST THAT AKIRA PASSES ACTUALLY EXIST
+      #
+      # Quan trọng:
+      # không chỉ kiểm tra clang-cl chạy được;
+      # phải chứng minh binary compiler có các Akira pass.
+      # ============================================================
+
+      - name: Verify Akira obfuscation passes
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $testDir = Join-Path `
+            $env:RUNNER_TEMP `
+            'akira-pass-test'
+
+          New-Item `
+            -ItemType Directory `
+            -Path $testDir `
+            -Force |
+            Out-Null
+
+          $testCpp = Join-Path `
+            $testDir `
+            'test.cpp'
+
+          @'
+          volatile int g_value = 123;
+
+          __declspec(noinline)
+          int test_function(int x)
+          {
+              const char* text = "AKIRA_PASS_TEST";
+
+              if (x > 50)
+                  return g_value + text[0];
+
+              return x * 7;
+          }
+
+          int main()
+          {
+              return test_function(42);
+          }
+          '@ |
+            Out-File `
+              -LiteralPath $testCpp `
+              -Encoding ascii
+
+          Push-Location $testDir
+
+          try {
+
+            & $env:AKIRA_CLANGCL `
+              /nologo `
+              /O2 `
+              /EHsc `
+              /Fe:akira_test.exe `
+              $testCpp `
+              -mllvm -irobf `
+              -mllvm -irobf-indbr `
+              -mllvm -irobf-icall `
+              -mllvm -irobf-indgv `
+              -mllvm -irobf-cse `
+              -mllvm -irobf-cff
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Akira obfuscation pass test thất bại."
+            }
+
+            if (!(Test-Path -LiteralPath 'akira_test.exe')) {
+              throw "Không tạo được Akira test EXE."
+            }
+
+            Write-Host "Akira obfuscation passes: OK"
+          }
+          finally {
+            Pop-Location
+          }
+
+      # ============================================================
+      # 8. DOWNLOAD PROJECT
+      # ============================================================
 
       - name: Download source ZIP from Google Drive
         env:
           DRIVE_URL: ${{ inputs.drive_url }}
         run: |
           $ErrorActionPreference = 'Stop'
+
           $driveInput = $env:DRIVE_URL.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($driveInput)) {
+            throw "Google Drive input rỗng."
+          }
 
           if ($driveInput -match '^[A-Za-z0-9_-]{20,}$') {
             $fileId = $driveInput
-          } elseif ($driveInput -match '/d/([A-Za-z0-9_-]+)') {
+          }
+          elseif ($driveInput -match '/d/([A-Za-z0-9_-]+)') {
             $fileId = $Matches[1]
-          } elseif ($driveInput -match '[?&]id=([A-Za-z0-9_-]+)') {
+          }
+          elseif ($driveInput -match '[?&]id=([A-Za-z0-9_-]+)') {
             $fileId = $Matches[1]
-          } else {
-            throw 'Không lấy được Google Drive file ID. Hãy nhập file ID hoặc link chia sẻ ZIP.'
+          }
+          else {
+            throw "Không lấy được Google Drive file ID."
           }
 
-          python -c "import gdown,sys,os; p=gdown.download(id=sys.argv[1], output='source.zip', quiet=False); raise SystemExit(0 if p and os.path.isfile(p) and os.path.getsize(p)>1024 else 1)" "$fileId"
+          python -c @"
+          import gdown
+          import os
+          import sys
 
-          if (!(Test-Path -LiteralPath source.zip)) {
-            throw 'Không tải được source.zip'
-          }
+          fid = sys.argv[1]
 
-          $zipSize = (Get-Item -LiteralPath source.zip).Length
-          Write-Host "Downloaded source.zip: $zipSize bytes"
-
-          New-Item -ItemType Directory -Path source -Force | Out-Null
-          Expand-Archive -LiteralPath source.zip -DestinationPath source -Force
-
-      - name: Locate CMake project
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $cmakeFile = Get-ChildItem source -Filter CMakeLists.txt -File -Recurse |
-            Where-Object {
-              $_.FullName -notmatch '[\\/](build|\.git)[\\/]' -and
-              (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'SpecialReloadClient.cpp'))
-            } |
-            Sort-Object { $_.FullName.Length } |
-            Select-Object -First 1
-
-          if ($null -eq $cmakeFile) {
-            throw 'Không tìm thấy CMakeLists.txt cạnh SpecialReloadClient.cpp trong ZIP.'
-          }
-
-          $project = $cmakeFile.Directory.FullName
-          "PROJECT_DIR=$project" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-
-          Write-Host "Project: $project"
-          Get-ChildItem -LiteralPath $project | Format-Table Name, Length, LastWriteTime
-
-      - name: Verify hardening sources are present
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location -LiteralPath $env:PROJECT_DIR
-
-          # Nếu ai đó push một bản source thiếu StringObf.h/AntiDebug.h (vô tình
-          # hoặc do revert), build phải fail ngay ở đây thay vì âm thầm ra một
-          # EXE yếu hơn bản đã hardened.
-          foreach ($required in @('StringObf.h', 'AntiDebug.h')) {
-            if (!(Test-Path -LiteralPath $required)) {
-              throw "Thiếu $required — source ZIP này không phải bản đã hardened."
-            }
-          }
-
-          $needle = 'OBF("/api/specialreload/register")'
-          if (!(Select-String -LiteralPath 'SpecialReloadClient.cpp' -Pattern ([regex]::Escape($needle)) -Quiet)) {
-            throw 'SpecialReloadClient.cpp không dùng OBF() cho endpoint register — hardening bị revert?'
-          }
-
-      - name: Configure (CMake + MSVC x64)
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location -LiteralPath $env:PROJECT_DIR
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
-
-      - name: Build ${{ inputs.build_config }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location -LiteralPath $env:PROJECT_DIR
-          cmake --build build --config ${{ inputs.build_config }} -- /m
-
-          $exe = Get-ChildItem build -Filter SpecialReloadClient.exe -File -Recurse |
-            Select-Object -First 1
-          if ($null -eq $exe) {
-            throw 'Build xong nhưng không thấy SpecialReloadClient.exe.'
-          }
-          "EXE_PATH=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "EXE: $($exe.FullName)"
-
-      - name: Run --self-test
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & $env:EXE_PATH --self-test
-          if ($LASTEXITCODE -ne 0) {
-            throw "--self-test thất bại (exit code $LASTEXITCODE)."
-          }
-
-      - name: Run ctest suite
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location -LiteralPath (Join-Path $env:PROJECT_DIR 'build')
-          ctest -C ${{ inputs.build_config }} --output-on-failure
-
-      - name: Security gate — no plaintext API surface, no CLR/PDB leak
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          # 1) Đọc EXE dạng Latin1 để soi các chuỗi ASCII plaintext không được
-          #    phép lộ trong bản đã hardened. Đây là bản CI của cùng check
-          #    `strings | grep` đã chạy tay lúc review source.
-          $bytes = [System.IO.File]::ReadAllBytes($env:EXE_PATH)
-          $text = [System.Text.Encoding]::Latin1.GetString($bytes)
-
-          $forbidden = @(
-            '/api/specialreload/register',
-            '/api/specialreload/poll',
-            '/api/specialreload/status',
-            'X-ICM-Client-Token'
+          p = gdown.download(
+              id=fid,
+              output='source.zip',
+              quiet=False
           )
-          $leaked = @()
-          foreach ($needle in $forbidden) {
-            if ($text.Contains($needle)) { $leaked += $needle }
-          }
-          if ($leaked.Count -gt 0) {
-            throw "Phát hiện chuỗi plaintext không nên có trong EXE: $($leaked -join ', ')"
-          }
-          Write-Host "OK: không rò rỉ API surface plaintext."
 
-          # 2) Không có CLR header (đảm bảo đây là native, không lỡ link managed).
-          $dumpbin = & where.exe dumpbin 2>$null | Select-Object -First 1
-          if ($dumpbin) {
-            $headers = & dumpbin /headers $env:EXE_PATH
-            if ($headers -match 'COM Descriptor') {
-              throw 'EXE có CLR/COM descriptor header — không phải native thuần.'
+          if not p:
+              raise SystemExit(1)
+
+          if not os.path.isfile(p):
+              raise SystemExit(2)
+
+          if os.path.getsize(p) <= 1024:
+              raise SystemExit(3)
+          "@ "$fileId"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Download source.zip thất bại."
+          }
+
+          if (!(Test-Path -LiteralPath 'source.zip')) {
+            throw "source.zip không tồn tại."
+          }
+
+          $sourceHash = Get-FileHash `
+            -LiteralPath 'source.zip' `
+            -Algorithm SHA256
+
+          "SOURCE_ZIP_SHA256=$($sourceHash.Hash)" |
+            Out-File `
+              $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "Source ZIP SHA256:"
+          Write-Host $sourceHash.Hash
+
+          # Validate ZIP.
+          Add-Type `
+            -AssemblyName System.IO.Compression.FileSystem
+
+          try {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead(
+              (Resolve-Path 'source.zip')
+            )
+
+            $count = $zip.Entries.Count
+            $zip.Dispose()
+
+            if ($count -lt 1) {
+              throw "ZIP rỗng."
+            }
+          }
+          catch {
+            throw "ZIP không hợp lệ: $($_.Exception.Message)"
+          }
+
+          if (Test-Path -LiteralPath 'source') {
+            Remove-Item `
+              -LiteralPath 'source' `
+              -Recurse `
+              -Force
+          }
+
+          Expand-Archive `
+            -LiteralPath 'source.zip' `
+            -DestinationPath 'source' `
+            -Force
+
+      # ============================================================
+      # 9. LOCATE PROJECT
+      # ============================================================
+
+      - name: Locate SpecialReloadClient project
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $cmake = Get-ChildItem `
+            -LiteralPath 'source' `
+            -Filter 'CMakeLists.txt' `
+            -File `
+            -Recurse |
+            Where-Object {
+
+              $_.FullName -notmatch `
+                '[\\/](build|\.git|out|cmake-build-[^\\/]+)[\\/]' `
+              -and
+
+              (
+                Test-Path `
+                  -LiteralPath (
+                    Join-Path `
+                      $_.Directory.FullName `
+                      'SpecialReloadClient.cpp'
+                  )
+              )
+
+            } |
+            Sort-Object {
+              $_.FullName.Length
+            } |
+            Select-Object -First 1
+
+          if ($null -eq $cmake) {
+            throw (
+              "Không tìm thấy CMakeLists.txt cạnh " +
+              "SpecialReloadClient.cpp."
+            )
+          }
+
+          $project = $cmake.Directory.FullName
+
+          "PROJECT_DIR=$project" |
+            Out-File `
+              $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "Project:"
+          Write-Host $project
+
+      # ============================================================
+      # 10. SOURCE HARDENING GATE
+      # ============================================================
+
+      - name: Verify hardened source
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-Location `
+            -LiteralPath $env:PROJECT_DIR
+
+          foreach ($file in @(
+            'SpecialReloadClient.cpp',
+            'StringObf.h',
+            'AntiDebug.h'
+          )) {
+
+            if (!(Test-Path -LiteralPath $file)) {
+              throw (
+                "Thiếu $file - source không phải hardened build."
+              )
             }
           }
 
-          # 3) Không phát tán .pdb cùng EXE (không có trong output dir này theo
-          #    thiết kế — cấu hình Release hiện tại không bật /Zi/DEBUG).
-          $exeDir = Split-Path -Parent $env:EXE_PATH
-          $pdbs = Get-ChildItem -LiteralPath $exeDir -Filter *.pdb -File -ErrorAction SilentlyContinue
-          if ($pdbs) {
-            throw "Có file .pdb trong thư mục output ($($pdbs.Name -join ', ')) — sẽ leak path/symbol nếu đóng gói kèm."
-          }
+          $cpp = Get-Content `
+            -LiteralPath 'SpecialReloadClient.cpp' `
+            -Raw
 
-      - name: Package release folder
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $exeDir = Split-Path -Parent $env:EXE_PATH
-          $stageDir = Join-Path $env:GITHUB_WORKSPACE 'stage'
-          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          $requirements = @(
+            'StringObf.h',
+            'AntiDebug.h',
+            'OBF("/api/specialreload/register")'
+          )
 
-          Copy-Item -LiteralPath $env:EXE_PATH -Destination $stageDir -Force
+          foreach ($needle in $requirements) {
 
-          $cfgTemplate = Join-Path $env:PROJECT_DIR 'reloader.cfg'
-          if (Test-Path -LiteralPath $cfgTemplate) {
-            Copy-Item -LiteralPath $cfgTemplate -Destination $stageDir -Force
-          }
-          foreach ($doc in @('README_HARDENING.md', 'HARDENING_ADDENDUM.md')) {
-            $docPath = Join-Path $env:PROJECT_DIR $doc
-            if (Test-Path -LiteralPath $docPath) {
-              Copy-Item -LiteralPath $docPath -Destination $stageDir -Force
+            if (!$cpp.Contains($needle)) {
+              throw "Hardening requirement thiếu: $needle"
             }
           }
 
-          # SHA256 để đối chiếu khi cutover (README section 5.4 / 9.2 yêu cầu
-          # checksum kèm release manifest).
-          $hash = Get-FileHash -LiteralPath (Join-Path $stageDir 'SpecialReloadClient.exe') -Algorithm SHA256
-          "$($hash.Hash)  SpecialReloadClient.exe" | Out-File (Join-Path $stageDir 'SHA256SUMS.txt') -Encoding ascii
+          Write-Host "Source hardening gate: OK"
 
-          $zip = Join-Path $env:GITHUB_WORKSPACE 'SpecialReloadClient_release.zip'
-          if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-          Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zip -CompressionLevel Optimal
+      # ============================================================
+      # 11. CONFIGURE PROJECT WITH AKIRA CLANG-CL
+      #
+      # Ninja được dùng thay Visual Studio generator để chắc chắn
+      # CMake sử dụng đúng custom clang-cl của Akira.
+      # ============================================================
 
-          "OUTPUT_ZIP=$zip" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "SHA256: $($hash.Hash)"
-
-      # Authenticode signing (khuyến nghị bắt buộc trước khi phát hành theo
-      # README section 10/13). Cần secrets.CODE_SIGN_PFX (base64) +
-      # secrets.CODE_SIGN_PASSWORD; bỏ qua nếu chưa cấu hình secret.
-      - name: Authenticode sign (optional)
-        if: ${{ secrets.CODE_SIGN_PFX != '' }}
-        env:
-          CODE_SIGN_PFX: ${{ secrets.CODE_SIGN_PFX }}
-          CODE_SIGN_PASSWORD: ${{ secrets.CODE_SIGN_PASSWORD }}
+      - name: Configure with Akira clang-cl
         run: |
           $ErrorActionPreference = 'Stop'
-          $pfxPath = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODE_SIGN_PFX))
-          & signtool sign /f $pfxPath /p $env:CODE_SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $env:EXE_PATH
-          & signtool verify /pa $env:EXE_PATH
-          Remove-Item -LiteralPath $pfxPath -Force
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: SpecialReloadClient-${{ inputs.build_config }}
-          path: ${{ env.OUTPUT_ZIP }}
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-          
+          Set-Location `
+            -LiteralPath $env:PROJECT_DIR
+
+          if (Test-Path -LiteralPath 'build') {
+            Remove-Item `
+              -LiteralPath 'build' `
+              -Recurse `
+              -Force
+          }
+
+          $flags = $env:AKIRA_FLAGS.Trim()
+
+          Write-Host "Akira flags:"
+          Write-Host $flags
+
+          cmake `
+            -S . `
+            -B build `
+            -G Ninja `
+            "-DCMAKE_BUILD_TYPE=${{ inputs.build_config }}" `
+            "-DCMAKE_C_COMPILER=$env:AKIRA_CLANGCL" `
+            "-DCMAKE_CXX_COMPILER=$env:AKIRA_CLANGCL" `
+            "-
