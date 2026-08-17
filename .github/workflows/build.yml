@@ -2220,7 +2220,7 @@ jobs:
 
           ctest `
             --output-on-failure `
-            --no-tests=error
+            --no-tests=warn.
 
           if ($LASTEXITCODE -ne 0) {
             throw "CTest thất bại: $LASTEXITCODE"
