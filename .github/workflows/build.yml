@@ -1,4 +1,4 @@
-name: Build SpecialReloadClient - Akira LLVM17 PRECHECKED v16
+name: Build SpecialReloadClient - Universal Root Trust Security V5 Stable
 
 on:
   workflow_dispatch:
@@ -1078,8 +1078,11 @@ jobs:
 
           foreach ($required in @(
             'SpecialReloadClient.cpp',
+            'CngAuth.cpp',
+            'CngAuth.h',
+            'NativeHttp.cpp',
+            'NativeHttp.h',
             'StringObf.h',
-            'AntiDebug.h'
           )) {
             if (!(Test-Path -LiteralPath $required)) {
               throw "Thiếu $required — source ZIP không phải hardened source."
@@ -1092,8 +1095,9 @@ jobs:
 
           foreach ($needle in @(
             'StringObf.h',
-            'AntiDebug.h',
-            'OBF("/api/specialreload/register")'
+            'CngAuth.h',
+            'X-ICM-Signature',
+            '/api/specialreload/register'
           )) {
             if (!$cpp.Contains($needle)) {
               throw "Hardening source gate thiếu: $needle"
@@ -2220,7 +2224,7 @@ jobs:
 
           ctest `
             --output-on-failure `
-            --no-tests=ignore
+            --no-tests=error
 
           if ($LASTEXITCODE -ne 0) {
             throw "CTest thất bại: $LASTEXITCODE"
@@ -2243,10 +2247,11 @@ jobs:
           $wide = [System.Text.Encoding]::Unicode.GetString($bytes)
 
           $forbidden = @(
-            '/api/specialreload/register',
-            '/api/specialreload/poll',
-            '/api/specialreload/status',
-            'X-ICM-Client-Token'
+            'X-ICM-Client-Token',
+            'GATEWAY_SHARED_KEY=',
+            'SECRET_KEY=',
+            'CLIENT_TOKEN=',
+            'CONFIG_MAC='
           )
 
           $leaked = @()
@@ -2527,27 +2532,11 @@ jobs:
             -Destination $releaseExe `
             -Force
 
-          # Chỉ package reloader.cfg nếu không chứa token/MAC thật.
+          # V5 never packages reloader.cfg. The file is an opaque machine-bound DPAPI blob and
+          # must be created on the target by the client itself or --seal-config.
           $cfg = Join-Path $env:PROJECT_DIR 'reloader.cfg'
-
           if (Test-Path -LiteralPath $cfg) {
-            $cfgText = Get-Content -LiteralPath $cfg -Raw
-
-            $secretConfigPatterns = @(
-              '(?im)^\s*CLIENT_TOKEN\s*=\s*\S+\s*$',
-              '(?im)^\s*CONFIG_MAC\s*=\s*\S+\s*$'
-            )
-
-            foreach ($pattern in $secretConfigPatterns) {
-              if ($cfgText -match $pattern) {
-                throw 'reloader.cfg chứa CLIENT_TOKEN/CONFIG_MAC thật. Không package secret vào artifact.'
-              }
-            }
-
-            Copy-Item `
-              -LiteralPath $cfg `
-              -Destination $stageDir `
-              -Force
+            throw 'Security V5 release source must not contain reloader.cfg; target creates ICM5CFG1 locally.'
           }
 
           foreach ($doc in @(
