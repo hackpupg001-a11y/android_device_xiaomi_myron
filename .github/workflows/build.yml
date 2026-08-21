@@ -1082,7 +1082,7 @@ jobs:
             'CngAuth.h',
             'NativeHttp.cpp',
             'NativeHttp.h',
-            'StringObf.h',
+            'StringObf.h'
           )) {
             if (!(Test-Path -LiteralPath $required)) {
               throw "Thiếu $required — source ZIP không phải hardened source."
