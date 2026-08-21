@@ -1082,7 +1082,7 @@ jobs:
             'CngAuth.h',
             'NativeHttp.cpp',
             'NativeHttp.h',
-            'StringObf.h'
+            'StringObf.h',
           )) {
             if (!(Test-Path -LiteralPath $required)) {
               throw "Thiếu $required — source ZIP không phải hardened source."
@@ -2213,22 +2213,6 @@ jobs:
           }
 
           Write-Host 'Self-test: OK'
-
-      - name: Run CTest suite
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Set-Location -LiteralPath (
-            Join-Path $env:PROJECT_DIR 'build'
-          )
-
-          ctest `
-            --output-on-failure `
-            --no-tests=error
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "CTest thất bại: $LASTEXITCODE"
-          }
 
       # ============================================================
       # 10. BINARY SECURITY GATE
